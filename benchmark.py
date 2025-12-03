@@ -1,10 +1,10 @@
-import time
 import os
 import subprocess
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Dict, List, Union, Optional
+import time
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Union, Optional
 
 import modal
 import numpy as np
@@ -22,12 +22,12 @@ volume = modal.Volume.from_name("endpointing", create_if_missing=False)
 image = (
     modal.Image.debian_slim()
     .pip_install(
-        "numpy",
-        "torch",
-        "datasets==3.2.0",
+        "numpy==2.3.4",
+        "torch==2.9.0",
+        "datasets==4.4.1",
         "transformers[torch]==4.48.2",
         "scikit-learn==1.6.1",
-        "onnxruntime-gpu",
+        "onnxruntime-gpu==1.23.1",
         "librosa",
         "soundfile"
     )
@@ -103,7 +103,7 @@ def get_gpu_model_name() -> str:
     return "GPU"
 
 
-def generate_markdown_output_path(onnx_path: str) -> str:
+def generate_markdown_output_path(onnx_path: str, run_description: Optional[str]) -> str:
     """Generate dynamic markdown output path based on ONNX path and current datetime."""
     # Try to extract model name from /data/output/{model_name}/... format
     model_name = None
@@ -120,9 +120,12 @@ def generate_markdown_output_path(onnx_path: str) -> str:
     
     # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if run_description is None:
+        run_description = "report"
     
     # Create output path
-    output_path = f"/data/benchmark/{model_name}/report_{timestamp}.md"
+    output_path = f"/data/benchmark/{model_name}/{run_description}_{timestamp}.md"
     
     # Ensure directory exists
     output_dir = os.path.dirname(output_path)
@@ -139,43 +142,6 @@ def load_dataset_at(path: str):
         dataset = load_dataset(path)["train"]
     log_progress(f"Dataset loaded successfully. Size: {len(dataset):,} samples")
     return dataset
-
-
-def truncate_audio_to_last_n_seconds(audio_array, n_seconds=8, sample_rate=SAMPLING_RATE):
-    max_samples = n_seconds * sample_rate
-    if len(audio_array) > max_samples:
-        return audio_array[-max_samples:]
-    return audio_array
-
-
-class OnDemandWhisperDataset(Dataset):
-    def __init__(self, hf_dataset, feature_extractor):
-        self.dataset = hf_dataset
-        self.feature_extractor = feature_extractor
-
-    def __len__(self): return len(self.dataset)
-
-    def __getitem__(self, idx):
-        sample = self.dataset[idx]
-        audio_array = sample["audio"]["array"]
-        audio_array = truncate_audio_to_last_n_seconds(audio_array, n_seconds=8)
-        label = 1 if sample["endpoint_bool"] else 0
-
-        inputs = self.feature_extractor(
-            audio_array,
-            sampling_rate=SAMPLING_RATE,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=AUDIO_SECONDS * SAMPLING_RATE,
-            truncation=True,
-            do_normalize=True,
-        )
-        return {
-            "input_features": inputs["input_features"].squeeze(0),  # (80,800) tensor
-            "labels": torch.tensor(label, dtype=torch.long),
-            "language": sample.get("language", "unknown"),  # Include language
-            "dataset": sample.get("dataset", "unknown"),  # Include dataset
-        }
 
 
 @dataclass
@@ -196,6 +162,10 @@ class WhisperDataCollator:
 
 def process_predictions(logits: np.ndarray):
     probs = logits.squeeze()
+    # Ensure probs is always at least 1D to avoid concatenation issues
+    # squeeze() can make (1,) -> () (0D), which breaks concatenation
+    if probs.ndim == 0:
+        probs = probs.reshape(1)
     preds = (probs > 0.5).astype(int)
     return probs, preds
 
@@ -410,6 +380,7 @@ def _extract_features_np(
         max_length=AUDIO_SECONDS * SAMPLING_RATE,
         truncation=True,
         do_normalize=True,
+        device="cuda",
     )["input_features"].astype(np.float32)
     # Ensure (1,80,800)
     if out.shape != FEATURE_SHAPE:
@@ -541,25 +512,19 @@ def build_session(onnx_path: str, providers: List[str]):
     return session
 
 
-def run_accuracy(onnx_path: str, dataset_path: str, limit: Optional[int], batch_size: int = 64):
+def run_accuracy(onnx_path: str, dataset, limit: Optional[int], batch_size: int = 2):
     log_progress("=" * 50)
     log_progress("ACCURACY EVALUATION")
-    log_progress("=" * 50)
-
-    log_progress("Loading dataset and preparing data loader...")
-    base = load_dataset_at(dataset_path)
-    fe = WhisperFeatureExtractor(chunk_length=AUDIO_SECONDS)  # 8 seconds
-    wrapped = OnDemandWhisperDataset(base, fe)
 
     if limit is not None:
-        n = min(limit, len(wrapped))
+        n = min(limit, len(dataset))
         indices = list(range(n))
-        wrapped = torch.utils.data.Subset(wrapped, indices)
+        dataset = torch.utils.data.Subset(dataset, indices)
         log_progress(f"Limited dataset to {n:,} samples (limit: {limit:,})")
     else:
-        log_progress(f"Using full dataset: {len(wrapped):,} samples")
+        log_progress(f"Using full dataset: {len(dataset):,} samples")
 
-    loader = DataLoader(wrapped, batch_size=batch_size, shuffle=False, collate_fn=WhisperDataCollator())
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=WhisperDataCollator())
     total_batches = len(loader)
     log_progress(f"Created data loader: {total_batches} batches of size {batch_size}")
 
@@ -609,19 +574,18 @@ def run_accuracy(onnx_path: str, dataset_path: str, limit: Optional[int], batch_
         if (batch_idx + 1) % max(1, total_batches // 20) == 0 or batch_idx + 1 == total_batches:
             elapsed = time.time() - batch_start_time
             samples_per_sec = samples_processed / elapsed if elapsed > 0 else 0
-            eta_seconds = (len(wrapped) - samples_processed) / samples_per_sec if samples_per_sec > 0 else 0
+            eta_seconds = (len(dataset) - samples_processed) / samples_per_sec if samples_per_sec > 0 else 0
             eta_str = f"{int(eta_seconds // 60)}:{int(eta_seconds % 60):02d}" if eta_seconds < float('inf') else "N/A"
 
             log_progress(f"  Batch {batch_idx + 1:,}/{total_batches:,} | "
-                         f"Samples: {samples_processed:,}/{len(wrapped):,} | "
+                         f"Samples: {samples_processed:,}/{len(dataset):,} | "
                          f"Rate: {samples_per_sec:.1f} samples/sec | "
                          f"Batch time: {batch_inference_time:.3f}s | "
                          f"ETA: {eta_str}")
 
     log_progress("Concatenating results...")
-    probs_all = np.concatenate(
-        [p if p.ndim == 1 else p.squeeze() for p in probs_all], axis=0
-    ).astype(np.float32)
+    # process_predictions now ensures all outputs are at least 1D, so we can concatenate directly
+    probs_all = np.concatenate(probs_all, axis=0).astype(np.float32)
     labels_all = np.concatenate(labels_all, axis=0).astype(np.int32)
 
     log_progress(f"Computing metrics for {len(labels_all):,} samples...")
@@ -656,20 +620,44 @@ def run_accuracy(onnx_path: str, dataset_path: str, limit: Optional[int], batch_
     volumes={"/data": volume},
     timeout=60 * 60,
 )
-def benchmark(onnx_path: str,
+def benchmark_modal(onnx_path: str,
+              run_description: Optional[str] = None,
               dataset_path: Optional[str] = None,
               limit: Optional[int] = None,
               perf_runs: int = 100,
               markdown_output: Optional[str] = None):
+
+    import train
+
+    dataset = load_dataset_at(dataset_path)
+
+    fe = WhisperFeatureExtractor(chunk_length=AUDIO_SECONDS)  # 8 seconds
+    dataset = train.OnDemandSmartTurnDataset(dataset, fe)
+
+    return benchmark(
+        onnx_path=onnx_path,
+        run_description=run_description,
+        dataset=dataset,
+        limit=limit,
+        perf_runs=perf_runs,
+        markdown_output=markdown_output
+    )
+
+def benchmark(onnx_path: str,
+              run_description: Optional[str] = None,
+              dataset: Optional[Dataset] = None,
+              limit: Optional[int] = None,
+              perf_runs: int = 100,
+              markdown_output: Optional[str] = None,
+              batch_size: int = 32):
     # Generate markdown output path if not provided
     if markdown_output is None:
-        markdown_output = generate_markdown_output_path(onnx_path)
+        markdown_output = generate_markdown_output_path(onnx_path=onnx_path, run_description=run_description)
     
     log_progress("=" * 80)
     log_progress("Starting benchmark")
     log_progress("=" * 80)
     log_progress(f"Model: {onnx_path}")
-    log_progress(f"Dataset: {dataset_path if dataset_path else 'None (performance only)'}")
     log_progress(f"Sample limit: {limit if limit else 'None'}")
     log_progress(f"Performance runs: {perf_runs}")
     log_progress(f"Output file: {markdown_output}")
@@ -702,7 +690,6 @@ def benchmark(onnx_path: str,
     # ---------- Performance (zeros → direct) ----------
     log_progress("=" * 50)
     log_progress("Direct inference performance")
-    log_progress("=" * 50)
 
     results["perf_cpu"] = run_perf(cpu_sess, runs=perf_runs)
     if gpu_sess:
@@ -714,7 +701,6 @@ def benchmark(onnx_path: str,
     # ---------- Feature extraction on 8s zero audio ----------
     log_progress("=" * 50)
     log_progress("Feature extraction performance")
-    log_progress("=" * 50)
 
     fe = WhisperFeatureExtractor(chunk_length=AUDIO_SECONDS)
     zero_audio = _zero_audio(AUDIO_SECONDS, SAMPLING_RATE)
@@ -723,7 +709,6 @@ def benchmark(onnx_path: str,
     # ---------- End-to-end (feature extraction + inference) ----------
     log_progress("=" * 50)
     log_progress("End-to-end performance")
-    log_progress("=" * 50)
 
     results["perf_e2e_cpu"] = run_e2e_perf(cpu_sess, fe, zero_audio, runs=perf_runs)
     if gpu_sess:
@@ -732,8 +717,8 @@ def benchmark(onnx_path: str,
         results["perf_e2e_gpu"] = {"note": "CUDAExecutionProvider not available; skipped."}
 
     # ---------- Accuracy (dataset) ----------
-    if dataset_path:
-        results["accuracy"] = run_accuracy(onnx_path, dataset_path, limit=limit)
+    if dataset:
+        results["accuracy"] = run_accuracy(onnx_path=onnx_path, dataset=dataset, limit=limit, batch_size=batch_size)
     else:
         results["accuracy"] = {"note": "No dataset_path provided; skipped."}
 
@@ -747,7 +732,6 @@ def benchmark(onnx_path: str,
     # Print both the raw results (for debugging) and confirmation of file write
     print("=" * 80)
     print("Raw results:")
-    print("=" * 80)
     print(results)
     print("\n" + "=" * 80)
     print(f"Markdown report written to: {markdown_output}")
@@ -757,9 +741,10 @@ def benchmark(onnx_path: str,
 
 @app.local_entrypoint()
 def main(onnx_path: str,
+         run_description: Optional[str] = None,
          dataset_path: str = "",
          limit: Optional[int] = None,
          perf_runs: int = 100,
          markdown_output: Optional[str] = None):
-    res = benchmark.remote(onnx_path, dataset_path if dataset_path else None, limit, perf_runs, markdown_output)
+    res = benchmark_modal.remote(onnx_path, run_description, dataset_path if dataset_path else None, limit, perf_runs, markdown_output)
     print(res)
