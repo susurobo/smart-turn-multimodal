@@ -2,7 +2,7 @@ import numpy as np
 import onnxruntime as ort
 from transformers import WhisperFeatureExtractor
 
-ONNX_MODEL_PATH = "smart-turn-v3.1-alpha1.onnx"
+ONNX_MODEL_PATH = "smart-turn-v3.1.onnx"
 
 def build_session(onnx_path):
     so = ort.SessionOptions()
