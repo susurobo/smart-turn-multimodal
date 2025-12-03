@@ -231,11 +231,11 @@ class ProgressLoggerCallback(TrainerCallback):
 
     def on_epoch_begin(self, args, state, control, **kwargs):
         current_epoch = state.epoch + 1 if state.epoch is not None else 1
-        log.info(f"Starting epoch {current_epoch}/{args.num_train_epochs}")
+        log.info(f"Starting epoch {int(current_epoch)}/{args.num_train_epochs}")
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        current_epoch = state.epoch + 1 if state.epoch is not None else 1
-        log.info(f"Completed epoch {current_epoch}/{args.num_train_epochs}")
+        current_epoch = state.epoch if state.epoch is not None else 1
+        log.info(f"Completed epoch {int(current_epoch)}/{args.num_train_epochs}")
 
     def on_evaluate_begin(self):
         log.info("Starting evaluation...")

@@ -1,63 +1,40 @@
-import copy
-import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Dict, Union
 
-import matplotlib.pyplot as plt
-import modal
 import numpy as np
 import onnx
-import onnxruntime as ort
-import seaborn as sns
 import torch
 import wandb
 from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantType, quant_pre_process, \
     QuantFormat, CalibrationMethod
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from torch import nn
-from torch.ao.quantization import disable_fake_quant, disable_observer, FakeQuantize, FusedMovingAvgObsFakeQuantize
+from torch.export import Dim
 from torch.nn.functional import softmax
 from torch.utils.data import Dataset
 from transformers import WhisperFeatureExtractor, WhisperPreTrainedModel, WhisperConfig
 # noinspection PyProtectedMember
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
+# noinspection PyProtectedMember
 from transformers.trainer import Trainer
-from transformers.trainer_callback import TrainerCallback, EarlyStoppingCallback
+from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import IntervalStrategy
 from transformers.training_args import TrainingArguments
 
+from benchmark import benchmark
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from logger import log, log_model_structure, log_dataset_statistics, log_dependencies, ProgressLoggerCallback
 
-app = modal.App("endpointing-training")
-volume = modal.Volume.from_name("endpointing", create_if_missing=False)
-
-image = modal.Image.debian_slim().pip_install(
-    "torch",
-    "transformers[torch]==4.48.2",
-    "datasets==3.2.0",
-    "scikit-learn==1.6.1",
-    "seaborn",
-    "matplotlib",
-    "numpy",
-    "librosa",
-    "soundfile",
-    "wandb",
-    "torchaudio",
-    "onnx",
-    "onnxruntime",
-).add_local_python_source("logger")
-
 CONFIG = {
-    "model_name": "openai/whisper-tiny",
+    "run_name_prefix": "v3.1",
+    "base_model_name": "openai/whisper-tiny",
 
-    "datasets_training": ["/data/datasets/smart-turn-data-v3-train"],
-    "datasets_test": ["/data/datasets/smart-turn-data-v3-test"],
+    "datasets_training": ["smart-turn-data-v3.1-train"],
+    "datasets_test": ["smart-turn-data-v3.1-test"],
 
     "learning_rate": 5e-5,
-    "num_epochs": 4, # overfitting starts to occur beyond 4 epochs
+    "num_epochs": 4,
     "train_batch_size": 384,
     "eval_batch_size": 128,
     "warmup_ratio": 0.2,
@@ -67,12 +44,10 @@ CONFIG = {
     "save_steps": 500,
     "logging_steps": 100,
 
-    "qat_start_epoch": 1,
-    "quantization_backend": "fbgemm",
-
-    "onnx_opset_version": 20,
-    "calibration_dataset_size": 256,
+    "onnx_opset_version": 18,
+    "calibration_dataset_size": 1024,
 }
+
 
 class SmartTurnV3Model(WhisperPreTrainedModel):
     def __init__(self, config: WhisperConfig):
@@ -133,9 +108,6 @@ class SmartTurnV3Model(WhisperPreTrainedModel):
 
         logits = self.classifier(pooled)
 
-        if torch.isnan(logits).any():
-            raise ValueError("NaN values detected in logits")
-
         if labels is not None:
             # Calculate positive sample weight based on batch statistics
             pos_weight = ((labels == 0).sum() / (labels == 1).sum()).clamp(min=0.1, max=10.0)
@@ -151,39 +123,31 @@ class SmartTurnV3Model(WhisperPreTrainedModel):
 
 
 class CalibrationDataset:
-    """Calibration dataset for ONNX quantization with stratified sampling"""
+    """Calibration dataset for ONNX quantization with stratified sampling (early-stop)."""
 
-    def __init__(self, dataset, feature_extractor, max_samples=500):
+    def __init__(self, dataset, feature_extractor, max_samples):
+
+        log.info("Building calibration dataset...")
+
         self.feature_extractor = feature_extractor
 
-        if hasattr(dataset, 'dataset'):
-            # Ensure balanced sampling of endpoint classes
-            underlying = dataset.dataset
-            positive_indices = [i for i, sample in enumerate(underlying) if sample["endpoint_bool"]]
-            negative_indices = [i for i, sample in enumerate(underlying) if not sample["endpoint_bool"]]
+        ds = dataset.dataset.shuffle(seed=42)
+        n = min(max_samples, len(ds))
+        subset = ds.select(range(n))
+        self.dataset = subset
 
-            # Sample half from each class
-            import random
-            random.seed(42)
-            pos_sample_size = min(max_samples // 2, len(positive_indices))
-            neg_sample_size = min(max_samples - pos_sample_size, len(negative_indices))
+        label_view = subset.select_columns(["endpoint_bool"])
+        labels = label_view["endpoint_bool"]
+        pos = sum(1 for v in labels if v)
+        neg = len(labels) - pos
 
-            selected_indices = (random.sample(positive_indices, pos_sample_size) +
-                                random.sample(negative_indices, neg_sample_size))
-            self.indices = selected_indices[:max_samples]
-            self.dataset = underlying
-
-            log.info(
-                f"Calibration dataset: {pos_sample_size} positive + {neg_sample_size} negative = {len(self.indices)} total samples")
-        else:
-            raise ValueError("Invalid dataset")
+        log.info(f"Calibration dataset: {n} samples (positives={pos}, negatives={neg})")
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        actual_idx = self.indices[idx]
-        sample = self.dataset[actual_idx]
+        sample = self.dataset[idx]
 
         audio_array = sample["audio"]["array"]
         audio_array = truncate_audio_to_last_n_seconds(audio_array, n_seconds=8)
@@ -216,57 +180,10 @@ class ONNXCalibrationDataReader(CalibrationDataReader):
             return None
 
 
-class QuantizationAwareTrainer(Trainer):
-    """Custom trainer with quantization aware training support"""
-
-    def __init__(self, *args, qat_config=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.qat_config = qat_config
-        self.qat_enabled = False
-
-    def _prepare_model_for_qat(self):
-        if not self.qat_enabled:
-            torch.backends.quantized.engine = self.qat_config["quantization_backend"]
-
-            qconfig = torch.quantization.get_default_qat_qconfig(self.qat_config["quantization_backend"])
-
-            self.model.qconfig = qconfig
-
-            embedding_count = 0
-            for name, module in self.model.named_modules():
-                if isinstance(module, torch.nn.Embedding):
-                    log.info(f"Excluding embedding layer from quantization: {name}")
-                    module.qconfig = None
-                    embedding_count += 1
-
-            layernorm_count = 0
-            for name, module in self.model.named_modules():
-                if isinstance(module,
-                              (torch.nn.LayerNorm, torch.nn.GroupNorm, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
-                    log.info(f"Excluding normalization layer from quantization: {name}")
-                    module.qconfig = None
-                    layernorm_count += 1
-
-            torch.quantization.prepare_qat(self.model, inplace=True)
-
-            self.qat_enabled = True
-
-            log.info("Model prepared for quantization aware training")
-            log.info(
-                f"Excluded {embedding_count} embedding layers and {layernorm_count} normalization layers from quantization")
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override training step to handle QAT preparation"""
-        if not self.qat_enabled and self.state.epoch >= self.qat_config["qat_start_epoch"]:
-            self._prepare_model_for_qat()
-
-        return super().training_step(model, inputs)
-
-
-def export_to_onnx_fp32(model, example_input, output_path, config):
-    """Export QAT model to ONNX FP32 format"""
+def export_to_onnx_fp32(model, output_path, config):
+    """Export model to ONNX FP32 format"""
     try:
-        log.info("Exporting QAT model to ONNX FP32...")
+        log.info("Exporting model to ONNX FP32...")
 
         class ONNXExportWrapper(torch.nn.Module):
             def __init__(self, inner):
@@ -275,90 +192,114 @@ def export_to_onnx_fp32(model, example_input, output_path, config):
 
             def forward(self, input_features):
                 out = self.inner(input_features)
-                return out["logits"] if isinstance(out, dict) else out
+                logits = out["logits"] if isinstance(out, dict) else out
+                # Output (batch_size, 1) shape (2D) - standard format for single-output models
+                batch_size = logits.shape[0]
+                return logits.reshape(batch_size, 1)
 
         export_model = ONNXExportWrapper(model).eval().cpu()
 
-        disable_fake_quant(export_model)
-        disable_observer(export_model)
+        example_input_b1 = torch.randn(1, 80, 800)
+        example_input_b2 = torch.randn(2, 80, 800)
 
-        export_model = copy.deepcopy(export_model)
+        # Test with both batch size 1 and 2 to ensure consistent output shapes
+        with torch.no_grad():
+            test_output_1 = export_model(example_input_b1)
+            test_output_2 = export_model(example_input_b2)
+            assert test_output_1.shape == (1, 1), f"Expected (1, 1), got {test_output_1.shape}"
+            assert test_output_2.shape == (2, 1), f"Expected (2, 1), got {test_output_2.shape}"
 
-        def _strip_qat(m: torch.nn.Module):
-            for name, child in list(m.named_children()):
-                # recurse first
-                _strip_qat(child)
-                # replace fake-quant observers with identity
-                if isinstance(child, (FakeQuantize, FusedMovingAvgObsFakeQuantize)):
-                    setattr(m, name, torch.nn.Identity())
-                # convert any QAT module that implements to_float()
-                elif hasattr(child, "to_float") and callable(getattr(child, "to_float")):
-                    try:
-                        setattr(m, name, child.to_float())
-                    except Exception:
-                        pass
-
-        _strip_qat(export_model)
+        dynamic_shapes = {
+            'input_features': {0: Dim.DYNAMIC},
+        }
 
         torch.onnx.export(
-            export_model,
-            example_input,
-            output_path,
+            model=export_model,
+            args=(example_input_b2,),
+            f=output_path,
             export_params=True,
             opset_version=config["onnx_opset_version"],
-            do_constant_folding=True,
+            do_constant_folding=False,
             input_names=['input_features'],
             output_names=['logits'],
-            dynamic_axes={'input_features': {0: 'batch_size'}, 'logits': {0: 'batch_size'}},
-            verbose=False
+            dynamic_shapes=dynamic_shapes,
+            verbose=False,
+            external_data=False,
         )
 
         onnx_model = onnx.load(output_path)
         onnx.checker.check_model(onnx_model)
         log.info(f"FP32 ONNX model saved to {output_path}")
+
+        # Verify the exported model works with batch sizes 1 and 2 and outputs consistent shapes
+        import onnxruntime as ort
+        session = ort.InferenceSession(output_path)
+
+        example_input_1_np = example_input_b1.numpy().astype(np.float32)
+        outputs_1 = session.run(None, {'input_features': example_input_1_np})
+        assert outputs_1[0].shape == (1, 1), f"Expected (1, 1), got {outputs_1[0].shape}"
+
+        example_input_2_np = example_input_b2.numpy().astype(np.float32)
+        outputs_2 = session.run(None, {'input_features': example_input_2_np})
+        assert outputs_2[0].shape == (2, 1), f"Expected (2, 1), got {outputs_2[0].shape}"
+
+        log.info("ONNX model verification successful - consistent output shapes for both batch sizes")
+
         return output_path
 
-    except Exception as e:
-        log.error(f"Failed to export to ONNX: {e}")
+    except Exception:
+        log.exception("Failed to export to ONNX")
         return None
 
 
-def quantize_onnx_model(onnx_fp32_path, calibration_dataset, output_path):
+def quantize_onnx_model(
+        onnx_fp32_path: str,
+        training_dataset,
+        feature_extractor,
+        exports_path,
+        calibration_dataset_size: int):
     """Quantize ONNX model using static quantization"""
-    try:
-        log.info("Quantizing ONNX model to INT8...")
 
-        pre_path = output_path.replace(".onnx", "_pre.onnx")
-        quant_pre_process(
-            onnx_fp32_path,
-            pre_path,
-            skip_optimization=False,  # let it fold/clean
-            disable_shape_inference=False
-        )
-        # Calibrate + quantize
-        quantize_static(
-            model_input=pre_path,
-            model_output=output_path,
-            calibration_data_reader=ONNXCalibrationDataReader(calibration_dataset),
-            quant_format=QuantFormat.QDQ,
-            activation_type=QuantType.QUInt8,
-            weight_type=QuantType.QInt8,
-            per_channel=True,
-            calibrate_method=CalibrationMethod.MinMax,
-            op_types_to_quantize=["Conv", "MatMul", "Gemm"]
-        )
+    log.info("Invoking quant_pre_process...")
 
-        log.info(f"Quantized ONNX model saved to {output_path}")
+    pre_path = os.path.join(exports_path, "model_pre.onnx")
+    quant_pre_process(
+        onnx_fp32_path,
+        pre_path,
+        skip_optimization=False,  # let it fold/clean
+        skip_symbolic_shape=True,
+        verbose=1
+    )
 
-        # Verify the quantized model
-        quantized_model = onnx.load(output_path)
-        onnx.checker.check_model(quantized_model)
+    log.info(f"Invoking quantize_static for calibration dataset size: {calibration_dataset_size} ...")
 
-        return output_path
+    output_path = os.path.join(exports_path, f"model_int8_static_calib{calibration_dataset_size}.onnx")
 
-    except Exception as e:
-        log.error(f"Failed to quantize ONNX model: {e}")
-        return None
+    log.info("Building calibration dataset...")
+
+    calibration_dataset = CalibrationDataset(
+        training_dataset,
+        feature_extractor,
+        max_samples=calibration_dataset_size,
+    )
+
+    log.info("Invoking quantize_static...")
+
+    quantize_static(
+        model_input=pre_path,
+        model_output=output_path,
+        calibration_data_reader=ONNXCalibrationDataReader(calibration_dataset),
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QUInt8,
+        weight_type=QuantType.QInt8,
+        per_channel=True,
+        calibrate_method=CalibrationMethod.Entropy,
+        op_types_to_quantize=["Conv", "MatMul", "Gemm"],
+    )
+
+    log.info(f"Quantized ONNX models saved to {output_path}")
+
+    return output_path
 
 
 def load_dataset_at(path: str):
@@ -375,7 +316,7 @@ def truncate_audio_to_last_n_seconds(audio_array, n_seconds=8, sample_rate=16000
     return audio_array
 
 
-class OnDemandWhisperDataset(Dataset):
+class OnDemandSmartTurnDataset(Dataset):
     def __init__(self, hf_dataset, feature_extractor):
         self.dataset = hf_dataset
         self.feature_extractor = feature_extractor
@@ -406,13 +347,14 @@ class OnDemandWhisperDataset(Dataset):
             "input_features": inputs.input_features.squeeze(0),
             "labels": torch.tensor(label, dtype=torch.long),
             "language": sample.get("language", "eng"),
+            "dataset": sample.get("dataset", "unknown"),
             "midfiller": sample.get("midfiller", None),
             "endfiller": sample.get("endfiller", None),
         }
 
 
 @dataclass
-class WhisperDataCollator:
+class SmartTurnDataCollator:
     def __call__(self, features: List[Dict[str, Union[torch.Tensor, str, None]]]) -> Dict[str, torch.Tensor]:
         input_features = torch.stack([f["input_features"] for f in features])
         labels = torch.stack([f["labels"] for f in features])
@@ -464,49 +406,28 @@ def prepare_datasets_ondemand(feature_extractor, config):
         test_dataset = load_dataset_at(dataset_path)
         test_splits[dataset_name] = test_dataset
 
+    merged_test_dataset = concatenate_datasets(test_splits.values()).shuffle(seed=42)
+
     log.info("Wrapping datasets with OnDemandWhisperDataset...")
-    wrapped_training = OnDemandWhisperDataset(merged_training_dataset, feature_extractor)
-    wrapped_eval = OnDemandWhisperDataset(merged_eval_dataset, feature_extractor)
+    wrapped_training = OnDemandSmartTurnDataset(merged_training_dataset, feature_extractor)
+    wrapped_eval = OnDemandSmartTurnDataset(merged_eval_dataset, feature_extractor)
     wrapped_test_splits = {
-        name: OnDemandWhisperDataset(dataset, feature_extractor)
+        name: OnDemandSmartTurnDataset(dataset, feature_extractor)
         for name, dataset in test_splits.items()
     }
+    wrapped_test_merged = OnDemandSmartTurnDataset(merged_test_dataset, feature_extractor)
 
     return {
         "training": wrapped_training,
         "eval": wrapped_eval,
         "test": wrapped_test_splits,
+        "test_merged": wrapped_test_merged,
         "raw_datasets": {
             "training": merged_training_dataset,
             "eval": merged_eval_dataset,
             "test": test_splits
         }
     }
-
-
-def save_dataset_ids(datasets, output_dir):
-    ids_dict = {}
-
-    if 'id' in datasets["raw_datasets"]["training"].column_names:
-        train_ids = [id for id in datasets["raw_datasets"]["training"]["id"] if id is not None]
-        ids_dict["train"] = sorted(train_ids)
-
-    if 'id' in datasets["raw_datasets"]["eval"].column_names:
-        eval_ids = [id for id in datasets["raw_datasets"]["eval"]["id"] if id is not None]
-        ids_dict["eval"] = sorted(eval_ids)
-
-    ids_dict["test"] = {}
-    for name, dataset in datasets["raw_datasets"]["test"].items():
-        if 'id' in dataset.column_names:
-            test_ids = [id for id in dataset["id"] if id is not None]
-            ids_dict["test"][name] = sorted(test_ids)
-
-    ids_path = os.path.join(output_dir, "dataset_ids.json")
-    with open(ids_path, 'w') as f:
-        json.dump(ids_dict, f, indent=2)
-
-    log.info(f"Saved dataset IDs to {ids_path}")
-    return ids_path
 
 
 def process_predictions(logits):
@@ -717,48 +638,11 @@ def compute_metrics(eval_pred):
     }
 
 
-def evaluate_and_plot(trainer, dataset, split_name):
+def final_evaluate(trainer, dataset, split_name):
     log.info(f"Evaluating on {split_name} set...")
     metrics = trainer.evaluate(eval_dataset=dataset)
 
     predictions, labels, probs, preds = get_predictions_and_labels(trainer, dataset)
-
-    output_dir = os.path.join(trainer.args.output_dir, "evaluation_plots")
-    os.makedirs(output_dir, exist_ok=True)
-
-    plt.figure(figsize=(8, 6))
-    try:
-        cm = confusion_matrix(labels, preds)
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=['Incomplete', 'Complete'],
-                    yticklabels=['Incomplete', 'Complete'])
-        plt.title(f'Confusion Matrix - {split_name.capitalize()} Set')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.tight_layout()
-        confusion_matrix_path = os.path.join(output_dir, f'confusion_matrix_{split_name}.png')
-        plt.savefig(confusion_matrix_path)
-        plt.close()
-        log.info(f"Saved confusion matrix to {confusion_matrix_path}")
-    except Exception as e:
-        log.error(f"Could not create confusion matrix for {split_name}: {e}")
-        confusion_matrix_path = None
-
-    plt.figure(figsize=(10, 6))
-    try:
-        plt.hist(probs, bins=50, alpha=0.5, label='Probability of Complete')
-        plt.title(f'Distribution of Completion Probabilities - {split_name.capitalize()} Set')
-        plt.xlabel('Probability of Complete')
-        plt.ylabel('Count')
-        plt.legend()
-        plt.tight_layout()
-        prob_dist_path = os.path.join(output_dir, f'probability_distribution_{split_name}.png')
-        plt.savefig(prob_dist_path)
-        plt.close()
-        log.info(f"Saved probability distribution to {prob_dist_path}")
-    except Exception as e:
-        log.error(f"Could not create probability distribution for {split_name}: {e}")
-        prob_dist_path = None
 
     wandb_metrics = {
         f"final/{split_name}_accuracy": metrics["eval_accuracy"],
@@ -767,32 +651,17 @@ def evaluate_and_plot(trainer, dataset, split_name):
         f"final/{split_name}_f1": metrics["eval_f1"],
     }
 
-    if confusion_matrix_path:
-        wandb_metrics[f"final/confusion_matrix_{split_name}"] = wandb.Image(confusion_matrix_path)
-    if prob_dist_path:
-        wandb_metrics[f"final/probability_distribution_{split_name}"] = wandb.Image(prob_dist_path)
-
     wandb.log(wandb_metrics)
 
     return metrics, predictions
 
 
-@app.function(
-    image=image,
-    gpu="L4",
-    memory=8192,
-    cpu=6.0,
-    volumes={"/data": volume},
-    timeout=86400,
-    secrets=[modal.Secret.from_name("wandb-secret")],
-)
-def training_run(run_number):
+def do_training_run(run_name_suffix: str):
     log_dependencies()
 
-    now = datetime.now().strftime("%Y-%m-%d_%H:%M")
-    CONFIG["run_name"] = f"v3-{now}_run{run_number}"
+    run_name = CONFIG["run_name_prefix"] + "-" + run_name_suffix
 
-    log.info(f"Starting training run: {CONFIG['run_name']}")
+    log.info(f"Starting training run: {run_name}")
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     if not wandb_api_key:
@@ -800,13 +669,13 @@ def training_run(run_number):
 
     wandb_run = wandb.init(
         project="speech-endpointing",
-        name=CONFIG["run_name"],
+        name=run_name,
         config=CONFIG
     )
 
     wandb_run.define_metric(name="exttest/*", step_metric="train/global_step")
 
-    model = SmartTurnV3Model.from_pretrained(CONFIG["model_name"], num_labels=1, ignore_mismatched_sizes=True)
+    model = SmartTurnV3Model.from_pretrained(CONFIG["base_model_name"], num_labels=1, ignore_mismatched_sizes=True)
     feature_extractor = WhisperFeatureExtractor(chunk_length=8) # 8 seconds
 
     log_model_structure(model, CONFIG)
@@ -814,7 +683,7 @@ def training_run(run_number):
     datasets = prepare_datasets_ondemand(feature_extractor, CONFIG)
 
     training_args = TrainingArguments(
-        output_dir=f"/data/output/{CONFIG['run_name']}",
+        output_dir=f"/data/output/{run_name}",
         per_device_train_batch_size=CONFIG["train_batch_size"],
         per_device_eval_batch_size=CONFIG["eval_batch_size"],
         num_train_epochs=CONFIG["num_epochs"],
@@ -823,7 +692,7 @@ def training_run(run_number):
         eval_steps=CONFIG["eval_steps"],
         save_steps=CONFIG["save_steps"],
         logging_steps=CONFIG["logging_steps"],
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         metric_for_best_model="f1",
         greater_is_better=True,
         learning_rate=CONFIG["learning_rate"],
@@ -834,12 +703,11 @@ def training_run(run_number):
         dataloader_num_workers=6,
         dataloader_prefetch_factor=4,
         dataloader_pin_memory=True,
-        tf32=True,
+        tf32=False,
         disable_tqdm=True,
     )
 
     os.makedirs(training_args.output_dir, exist_ok=True)
-    save_dataset_ids(datasets, training_args.output_dir)
 
     log_dataset_statistics("training", datasets["training"])
     log_dataset_statistics("eval", datasets["eval"])
@@ -847,17 +715,14 @@ def training_run(run_number):
     for dataset_name, dataset in datasets["test"].items():
         log_dataset_statistics("test_" + dataset_name, dataset)
 
-    # Use custom quantization-aware trainer
-    trainer = QuantizationAwareTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=datasets["training"],
         eval_dataset=datasets["eval"],
         compute_metrics=compute_metrics,
-        data_collator=WhisperDataCollator(),
-        qat_config=CONFIG,
+        data_collator=SmartTurnDataCollator(),
         callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=5),
             ProgressLoggerCallback(log_interval=CONFIG["logging_steps"])
         ]
     )
@@ -867,7 +732,6 @@ def training_run(run_number):
         trainer=trainer
     ))
 
-    # Train the model
     log.info("Starting training...")
     trainer.train()
 
@@ -880,66 +744,58 @@ def training_run(run_number):
     export_path = os.path.join(final_save_path, "exports")
     os.makedirs(export_path, exist_ok=True)
 
-    example_input = torch.randn(1, 80, 800)
-
     onnx_fp32_path = os.path.join(export_path, "model_fp32.onnx")
-    onnx_int8_path = os.path.join(export_path, "model_int8.onnx")
 
-    # Export the QAT model directly (before torch.quantization.convert)
-    # This preserves the fake quantization nodes that ONNX can handle
     trainer.model.eval().cpu()
 
-    onnx_fp32_model_path = export_to_onnx_fp32(trainer.model, example_input, onnx_fp32_path, CONFIG)
-
-    if onnx_fp32_model_path is not None:
-        log.info("ONNX FP32 export successful")
-        wandb.log({"export/onnx_fp32_success": True})
-
-        calibration_dataset = CalibrationDataset(
-            datasets["training"],
-            feature_extractor,
-            max_samples=CONFIG["calibration_dataset_size"],
-        )
-
-        # Quantize ONNX model to INT8
-        quantized_onnx_path = quantize_onnx_model(onnx_fp32_model_path, calibration_dataset, onnx_int8_path)
-
-        if quantized_onnx_path is not None:
-            log.info("ONNX INT8 quantization successful")
-            wandb.log({"export/onnx_int8_success": True})
-
-            # Test the quantized ONNX model
-            try:
-                session = ort.InferenceSession(quantized_onnx_path)
-                test_input = calibration_dataset[0].reshape(1, 80, 800).astype(np.float32)
-                outputs = session.run(None, {"input_features": test_input})
-                log.info(f"ONNX model test successful. Output shape: {outputs[0].shape}")
-                wandb.log({"export/onnx_test_success": True})
-            except Exception as e:
-                log.error(f"ONNX model test failed: {e}")
-                wandb.log({"export/onnx_test_success": False})
-        else:
-            log.error("ONNX INT8 quantization failed")
-            wandb.log({"export/onnx_int8_success": False})
-    else:
-        log.error("ONNX FP32 export failed")
-        wandb.log({"export/onnx_fp32_success": False})
-
-    # Now convert the model to fully quantized format for PyTorch inference
-    trainer.model.eval().cpu()
-    quantized_model = torch.quantization.convert(copy.deepcopy(trainer.model), inplace=False)
-
-    # Save quantized PyTorch model
-    torch.save({
-        'model_state_dict': quantized_model.state_dict(),
-        'model_config': CONFIG,
-    }, os.path.join(final_save_path, "quantized_model.pth"))
+    onnx_fp32_model_path = export_to_onnx_fp32(trainer.model, onnx_fp32_path, CONFIG)
 
     log.info(f"Training and export completed. Models saved to: {final_save_path}")
 
     wandb.finish()
 
+    return onnx_fp32_model_path
 
-@app.local_entrypoint()
-def main(run_number: str = "00"):
-    training_run.remote(run_number)
+
+def do_quantization_run(fp32_model_path: str):
+    calibration_dataset_size = CONFIG["calibration_dataset_size"]
+
+    log.info(f"Starting quantization run on {fp32_model_path} (calib dataset size {calibration_dataset_size})")
+
+    feature_extractor = WhisperFeatureExtractor(chunk_length=8)  # 8 seconds
+
+    datasets = prepare_datasets_ondemand(feature_extractor, CONFIG)
+
+    parent_dir = os.path.dirname(fp32_model_path)
+
+    quantized_onnx_path = quantize_onnx_model(
+        onnx_fp32_path=fp32_model_path,
+        training_dataset=datasets["training"],
+        feature_extractor=feature_extractor,
+        exports_path=parent_dir,
+        calibration_dataset_size=calibration_dataset_size
+    )
+
+    return quantized_onnx_path
+
+
+def do_benchmark_run(model_paths: List[str]):
+    log.info(f"Benchmarking models: {model_paths}")
+
+    feature_extractor = WhisperFeatureExtractor(chunk_length=8)  # 8 seconds
+
+    dataset = prepare_datasets_ondemand(feature_extractor, CONFIG)["test_merged"]
+
+    for model_path in model_paths:
+        model_name = os.path.basename(model_path).replace(".onnx", "")
+        benchmark_path = os.path.join(os.path.dirname(model_path), "benchmarks")
+        os.makedirs(benchmark_path, exist_ok=True)
+
+        benchmark(
+            onnx_path=model_path,
+            run_description=model_name,
+            dataset=dataset,
+            limit=None,
+            markdown_output=f"{benchmark_path}/{model_name}.md",
+            batch_size=256
+        )
