@@ -147,6 +147,7 @@ You can run training locally or using [Modal](https://modal.com) (using `train_m
 
 ```
 # To run a training job on Modal, run:
+modal volume create endpointing
 modal run --detach train_modal.py
 ```
 
