@@ -6,16 +6,34 @@ import numpy as np
 import onnx
 import torch
 import wandb
-from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantType, quant_pre_process, \
-    QuantFormat, CalibrationMethod
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from onnxruntime.quantization import (
+    quantize_static,
+    CalibrationDataReader,
+    QuantType,
+    quant_pre_process,
+    QuantFormat,
+    CalibrationMethod,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
 from torch import nn
 from torch.export import Dim
 from torch.nn.functional import softmax
 from torch.utils.data import Dataset
-from transformers import WhisperFeatureExtractor, WhisperPreTrainedModel, WhisperConfig
+from transformers import (
+    WhisperFeatureExtractor,
+    WhisperPreTrainedModel,
+    WhisperConfig,
+)
+
 # noinspection PyProtectedMember
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
 # noinspection PyProtectedMember
 from transformers.trainer import Trainer
 from transformers.trainer_callback import TrainerCallback
@@ -24,26 +42,28 @@ from transformers.training_args import TrainingArguments
 
 from benchmark import benchmark
 from datasets import load_dataset, concatenate_datasets, load_from_disk
-from logger import log, log_model_structure, log_dataset_statistics, log_dependencies, ProgressLoggerCallback
+from logger import (
+    log,
+    log_model_structure,
+    log_dataset_statistics,
+    log_dependencies,
+    ProgressLoggerCallback,
+)
 
 CONFIG = {
     "run_name_prefix": "v3.1",
     "base_model_name": "openai/whisper-tiny",
-
-    "datasets_training": ["smart-turn-data-v3.1-train"],
-    "datasets_test": ["smart-turn-data-v3.1-test"],
-
+    "datasets_training": ["pipecat-ai/smart-turn-data-v3.1-train"],
+    "datasets_test": ["pipecat-ai/smart-turn-data-v3.1-test"],
     "learning_rate": 5e-5,
     "num_epochs": 4,
     "train_batch_size": 384,
     "eval_batch_size": 128,
     "warmup_ratio": 0.2,
     "weight_decay": 0.01,
-
     "eval_steps": 500,
     "save_steps": 500,
     "logging_steps": 100,
-
     "onnx_opset_version": 18,
     "calibration_dataset_size": 1024,
 }
@@ -60,9 +80,7 @@ class SmartTurnV3Model(WhisperPreTrainedModel):
         hidden_size = config.d_model
 
         self.pool_attention = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.Tanh(),
-            nn.Linear(256, 1)
+            nn.Linear(hidden_size, 256), nn.Tanh(), nn.Linear(256, 1)
         )
 
         self.classifier = nn.Sequential(
@@ -72,7 +90,7 @@ class SmartTurnV3Model(WhisperPreTrainedModel):
             nn.Dropout(0.1),
             nn.Linear(256, 64),
             nn.GELU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
 
         # Initialize classifier weights
@@ -110,7 +128,9 @@ class SmartTurnV3Model(WhisperPreTrainedModel):
 
         if labels is not None:
             # Calculate positive sample weight based on batch statistics
-            pos_weight = ((labels == 0).sum() / (labels == 1).sum()).clamp(min=0.1, max=10.0)
+            pos_weight = ((labels == 0).sum() / (labels == 1).sum()).clamp(
+                min=0.1, max=10.0
+            )
             loss_fct = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             labels = labels.float()
             loss = loss_fct(logits.view(-1), labels.view(-1))
@@ -126,7 +146,6 @@ class CalibrationDataset:
     """Calibration dataset for ONNX quantization with stratified sampling (early-stop)."""
 
     def __init__(self, dataset, feature_extractor, max_samples):
-
         log.info("Building calibration dataset...")
 
         self.feature_extractor = feature_extractor
@@ -141,7 +160,9 @@ class CalibrationDataset:
         pos = sum(1 for v in labels if v)
         neg = len(labels) - pos
 
-        log.info(f"Calibration dataset: {n} samples (positives={pos}, negatives={neg})")
+        log.info(
+            f"Calibration dataset: {n} samples (positives={pos}, negatives={neg})"
+        )
 
     def __len__(self):
         return len(self.dataset)
@@ -173,7 +194,9 @@ class ONNXCalibrationDataReader(CalibrationDataReader):
         try:
             idx = next(self.iterator)
             input_data = self.calibration_dataset[idx]  # shape (80, 800)
-            input_data = np.expand_dims(input_data, axis=0)  # shape (1, 80, 800)
+            input_data = np.expand_dims(
+                input_data, axis=0
+            )  # shape (1, 80, 800)
             input_data = input_data.astype(np.float32, copy=False)
             return {"input_features": input_data}
         except StopIteration:
@@ -206,11 +229,15 @@ def export_to_onnx_fp32(model, output_path, config):
         with torch.no_grad():
             test_output_1 = export_model(example_input_b1)
             test_output_2 = export_model(example_input_b2)
-            assert test_output_1.shape == (1, 1), f"Expected (1, 1), got {test_output_1.shape}"
-            assert test_output_2.shape == (2, 1), f"Expected (2, 1), got {test_output_2.shape}"
+            assert test_output_1.shape == (1, 1), (
+                f"Expected (1, 1), got {test_output_1.shape}"
+            )
+            assert test_output_2.shape == (2, 1), (
+                f"Expected (2, 1), got {test_output_2.shape}"
+            )
 
         dynamic_shapes = {
-            'input_features': {0: Dim.DYNAMIC},
+            "input_features": {0: Dim.DYNAMIC},
         }
 
         torch.onnx.export(
@@ -220,8 +247,8 @@ def export_to_onnx_fp32(model, output_path, config):
             export_params=True,
             opset_version=config["onnx_opset_version"],
             do_constant_folding=False,
-            input_names=['input_features'],
-            output_names=['logits'],
+            input_names=["input_features"],
+            output_names=["logits"],
             dynamic_shapes=dynamic_shapes,
             verbose=False,
             external_data=False,
@@ -233,17 +260,24 @@ def export_to_onnx_fp32(model, output_path, config):
 
         # Verify the exported model works with batch sizes 1 and 2 and outputs consistent shapes
         import onnxruntime as ort
+
         session = ort.InferenceSession(output_path)
 
         example_input_1_np = example_input_b1.numpy().astype(np.float32)
-        outputs_1 = session.run(None, {'input_features': example_input_1_np})
-        assert outputs_1[0].shape == (1, 1), f"Expected (1, 1), got {outputs_1[0].shape}"
+        outputs_1 = session.run(None, {"input_features": example_input_1_np})
+        assert outputs_1[0].shape == (1, 1), (
+            f"Expected (1, 1), got {outputs_1[0].shape}"
+        )
 
         example_input_2_np = example_input_b2.numpy().astype(np.float32)
-        outputs_2 = session.run(None, {'input_features': example_input_2_np})
-        assert outputs_2[0].shape == (2, 1), f"Expected (2, 1), got {outputs_2[0].shape}"
+        outputs_2 = session.run(None, {"input_features": example_input_2_np})
+        assert outputs_2[0].shape == (2, 1), (
+            f"Expected (2, 1), got {outputs_2[0].shape}"
+        )
 
-        log.info("ONNX model verification successful - consistent output shapes for both batch sizes")
+        log.info(
+            "ONNX model verification successful - consistent output shapes for both batch sizes"
+        )
 
         return output_path
 
@@ -253,11 +287,12 @@ def export_to_onnx_fp32(model, output_path, config):
 
 
 def quantize_onnx_model(
-        onnx_fp32_path: str,
-        training_dataset,
-        feature_extractor,
-        exports_path,
-        calibration_dataset_size: int):
+    onnx_fp32_path: str,
+    training_dataset,
+    feature_extractor,
+    exports_path,
+    calibration_dataset_size: int,
+):
     """Quantize ONNX model using static quantization"""
 
     log.info("Invoking quant_pre_process...")
@@ -268,12 +303,16 @@ def quantize_onnx_model(
         pre_path,
         skip_optimization=False,  # let it fold/clean
         skip_symbolic_shape=True,
-        verbose=1
+        verbose=1,
     )
 
-    log.info(f"Invoking quantize_static for calibration dataset size: {calibration_dataset_size} ...")
+    log.info(
+        f"Invoking quantize_static for calibration dataset size: {calibration_dataset_size} ..."
+    )
 
-    output_path = os.path.join(exports_path, f"model_int8_static_calib{calibration_dataset_size}.onnx")
+    output_path = os.path.join(
+        exports_path, f"model_int8_static_calib{calibration_dataset_size}.onnx"
+    )
 
     log.info("Building calibration dataset...")
 
@@ -303,13 +342,15 @@ def quantize_onnx_model(
 
 
 def load_dataset_at(path: str):
-    if path.startswith('/'):
+    if path.startswith("/"):
         return load_from_disk(path)["train"]
     else:
         return load_dataset(path)["train"]
 
 
-def truncate_audio_to_last_n_seconds(audio_array, n_seconds=8, sample_rate=16000):
+def truncate_audio_to_last_n_seconds(
+    audio_array, n_seconds=8, sample_rate=16000
+):
     max_samples = n_seconds * sample_rate
     if len(audio_array) > max_samples:
         return audio_array[-max_samples:]
@@ -355,7 +396,9 @@ class OnDemandSmartTurnDataset(Dataset):
 
 @dataclass
 class SmartTurnDataCollator:
-    def __call__(self, features: List[Dict[str, Union[torch.Tensor, str, None]]]) -> Dict[str, torch.Tensor]:
+    def __call__(
+        self, features: List[Dict[str, Union[torch.Tensor, str, None]]]
+    ) -> Dict[str, torch.Tensor]:
         input_features = torch.stack([f["input_features"] for f in features])
         labels = torch.stack([f["labels"] for f in features])
 
@@ -396,7 +439,9 @@ def prepare_datasets_ondemand(feature_extractor, config):
 
     log.info("Merging datasets...")
 
-    merged_training_dataset = concatenate_datasets(training_splits).shuffle(seed=42)
+    merged_training_dataset = concatenate_datasets(training_splits).shuffle(
+        seed=42
+    )
     merged_eval_dataset = concatenate_datasets(eval_splits)
 
     log.info("Loading test datasets...")
@@ -406,16 +451,24 @@ def prepare_datasets_ondemand(feature_extractor, config):
         test_dataset = load_dataset_at(dataset_path)
         test_splits[dataset_name] = test_dataset
 
-    merged_test_dataset = concatenate_datasets(test_splits.values()).shuffle(seed=42)
+    merged_test_dataset = concatenate_datasets(test_splits.values()).shuffle(
+        seed=42
+    )
 
     log.info("Wrapping datasets with OnDemandWhisperDataset...")
-    wrapped_training = OnDemandSmartTurnDataset(merged_training_dataset, feature_extractor)
-    wrapped_eval = OnDemandSmartTurnDataset(merged_eval_dataset, feature_extractor)
+    wrapped_training = OnDemandSmartTurnDataset(
+        merged_training_dataset, feature_extractor
+    )
+    wrapped_eval = OnDemandSmartTurnDataset(
+        merged_eval_dataset, feature_extractor
+    )
     wrapped_test_splits = {
         name: OnDemandSmartTurnDataset(dataset, feature_extractor)
         for name, dataset in test_splits.items()
     }
-    wrapped_test_merged = OnDemandSmartTurnDataset(merged_test_dataset, feature_extractor)
+    wrapped_test_merged = OnDemandSmartTurnDataset(
+        merged_test_dataset, feature_extractor
+    )
 
     return {
         "training": wrapped_training,
@@ -425,8 +478,8 @@ def prepare_datasets_ondemand(feature_extractor, config):
         "raw_datasets": {
             "training": merged_training_dataset,
             "eval": merged_eval_dataset,
-            "test": test_splits
-        }
+            "test": test_splits,
+        },
     }
 
 
@@ -435,7 +488,9 @@ def process_predictions(logits):
     Converts raw logits into squeezed probability predictions and binary predictions.
     """
     if np.isnan(logits).any() or not np.isfinite(logits).all():
-        raise ValueError("Non-finite or NaN values detected in logits during processing")
+        raise ValueError(
+            "Non-finite or NaN values detected in logits during processing"
+        )
 
     probs = logits.squeeze()
     preds = (probs > 0.5).astype(int)
@@ -460,7 +515,6 @@ def get_predictions_and_labels(trainer, dataset, metric_key_prefix=None):
 
 
 class ExternalEvaluationCallback(TrainerCallback):
-
     def __init__(self, test_datasets, trainer):
         super().__init__()
         self.test_datasets = test_datasets
@@ -479,11 +533,12 @@ class ExternalEvaluationCallback(TrainerCallback):
             metrics = compute_metrics((probs, labels))
 
             external_metrics = {
-                f"exttest/{dataset_name}_{k}": v
-                for k, v in metrics.items()
+                f"exttest/{dataset_name}_{k}": v for k, v in metrics.items()
             }
 
-            external_metrics[f"exttest/{dataset_name}_prob_dist"] = wandb.Histogram(probs)
+            external_metrics[f"exttest/{dataset_name}_prob_dist"] = (
+                wandb.Histogram(probs)
+            )
 
             external_metrics[f"train/global_step"] = state.global_step
 
@@ -491,69 +546,106 @@ class ExternalEvaluationCallback(TrainerCallback):
 
             wandb.log(external_metrics)
 
-            self._process_category_metrics(dataset, probs, labels, preds, language_metrics,
-                                           column_name='language', default_value='unknown-error')
-            self._process_category_metrics(dataset, probs, labels, preds, midfiller_metrics,
-                                           column_name='midfiller', default_value='unknown')
+            self._process_category_metrics(
+                dataset,
+                probs,
+                labels,
+                preds,
+                language_metrics,
+                column_name="language",
+                default_value="unknown-error",
+            )
+            self._process_category_metrics(
+                dataset,
+                probs,
+                labels,
+                preds,
+                midfiller_metrics,
+                column_name="midfiller",
+                default_value="unknown",
+            )
 
-        self._log_category_metrics(language_metrics, 'lang', state.global_step)
-        self._log_category_metrics(midfiller_metrics, 'midfiller', state.global_step)
+        self._log_category_metrics(language_metrics, "lang", state.global_step)
+        self._log_category_metrics(
+            midfiller_metrics, "midfiller", state.global_step
+        )
 
         if accuracies:
             lowest_accuracy = min(accuracies.values())
-            lowest_accuracy_dataset = min(accuracies.keys(), key=lambda k: accuracies[k])
+            lowest_accuracy_dataset = min(
+                accuracies.keys(), key=lambda k: accuracies[k]
+            )
 
             accuracy_values = list(accuracies.values())
             mean_accuracy = sum(accuracy_values) / len(accuracy_values)
 
-            wandb.log({
-                "exttest/lowest_accuracy": lowest_accuracy,
-                "exttest/lowest_accuracy_dataset": lowest_accuracy_dataset,
-                "exttest/mean_accuracy": mean_accuracy,
-                "exttest/accuracy_variance": np.var(accuracy_values),
-                "train/global_step": state.global_step
-            })
+            wandb.log(
+                {
+                    "exttest/lowest_accuracy": lowest_accuracy,
+                    "exttest/lowest_accuracy_dataset": lowest_accuracy_dataset,
+                    "exttest/mean_accuracy": mean_accuracy,
+                    "exttest/accuracy_variance": np.var(accuracy_values),
+                    "train/global_step": state.global_step,
+                }
+            )
 
             log.info(f"Overall accuracy metrics:")
-            log.info(f"  Lowest accuracy across all test datasets: {lowest_accuracy:.4f} ({lowest_accuracy_dataset})")
+            log.info(
+                f"  Lowest accuracy across all test datasets: {lowest_accuracy:.4f} ({lowest_accuracy_dataset})"
+            )
             log.info(f"  Mean accuracy: {mean_accuracy:.4f}")
             log.info(f"  Accuracy variance: {np.var(accuracy_values):.4f}")
 
-    def _process_category_metrics(self, dataset, probs, labels, preds, category_metrics,
-                                  column_name, default_value):
-        if hasattr(dataset, 'dataset'):
+    def _process_category_metrics(
+        self,
+        dataset,
+        probs,
+        labels,
+        preds,
+        category_metrics,
+        column_name,
+        default_value,
+    ):
+        if hasattr(dataset, "dataset"):
             underlying_dataset = dataset.dataset
         else:
             underlying_dataset = dataset
 
-        if hasattr(underlying_dataset, 'column_names') and column_name in underlying_dataset.column_names:
+        if (
+            hasattr(underlying_dataset, "column_names")
+            and column_name in underlying_dataset.column_names
+        ):
             categories = underlying_dataset[column_name]
         else:
             categories = [default_value] * len(dataset)
 
         for i, category in enumerate(categories):
-            category_key = str(category).lower() if category is not None else default_value
+            category_key = (
+                str(category).lower() if category is not None else default_value
+            )
 
             if category_key not in category_metrics:
                 category_metrics[category_key] = {
-                    'probs': [],
-                    'labels': [],
-                    'preds': []
+                    "probs": [],
+                    "labels": [],
+                    "preds": [],
                 }
 
-            category_metrics[category_key]['probs'].append(probs[i])
-            category_metrics[category_key]['labels'].append(labels[i])
-            category_metrics[category_key]['preds'].append(preds[i])
+            category_metrics[category_key]["probs"].append(probs[i])
+            category_metrics[category_key]["labels"].append(labels[i])
+            category_metrics[category_key]["preds"].append(preds[i])
 
-    def _log_category_metrics(self, category_metrics, metric_prefix, global_step):
+    def _log_category_metrics(
+        self, category_metrics, metric_prefix, global_step
+    ):
         category_accuracies = {}
 
         for category, data in category_metrics.items():
-            if len(data['labels']) == 0:
+            if len(data["labels"]) == 0:
                 continue
 
-            cat_probs = np.array(data['probs'])
-            cat_labels = np.array(data['labels'])
+            cat_probs = np.array(data["probs"])
+            cat_labels = np.array(data["labels"])
 
             metrics = compute_metrics((cat_probs, cat_labels))
 
@@ -562,55 +654,81 @@ class ExternalEvaluationCallback(TrainerCallback):
                 for k, v in metrics.items()
             }
 
-            category_specific_metrics[f"exttest/{metric_prefix}_{category}_prob_dist"] = wandb.Histogram(cat_probs)
-            category_specific_metrics[f"exttest/{metric_prefix}_{category}_sample_count"] = len(cat_labels)
+            category_specific_metrics[
+                f"exttest/{metric_prefix}_{category}_prob_dist"
+            ] = wandb.Histogram(cat_probs)
+            category_specific_metrics[
+                f"exttest/{metric_prefix}_{category}_sample_count"
+            ] = len(cat_labels)
             category_specific_metrics["train/global_step"] = global_step
 
             category_accuracies[category] = metrics["accuracy"]
 
             wandb.log(category_specific_metrics)
 
-            log.info(f"{metric_prefix.capitalize()} {category} metrics: accuracy={metrics['accuracy']:.4f}, "
-                     f"precision={metrics['precision']:.4f}, recall={metrics['recall']:.4f}, "
-                     f"f1={metrics['f1']:.4f}, samples={len(cat_labels)}")
+            log.info(
+                f"{metric_prefix.capitalize()} {category} metrics: accuracy={metrics['accuracy']:.4f}, "
+                f"precision={metrics['precision']:.4f}, recall={metrics['recall']:.4f}, "
+                f"f1={metrics['f1']:.4f}, samples={len(cat_labels)}"
+            )
 
         if category_accuracies:
             min_accuracy = min(category_accuracies.values())
             max_accuracy = max(category_accuracies.values())
-            mean_accuracy = sum(category_accuracies.values()) / len(category_accuracies)
+            mean_accuracy = sum(category_accuracies.values()) / len(
+                category_accuracies
+            )
 
-            best_category = max(category_accuracies.keys(), key=lambda k: category_accuracies[k])
-            worst_category = min(category_accuracies.keys(), key=lambda k: category_accuracies[k])
+            best_category = max(
+                category_accuracies.keys(), key=lambda k: category_accuracies[k]
+            )
+            worst_category = min(
+                category_accuracies.keys(), key=lambda k: category_accuracies[k]
+            )
 
             summary_metrics = {
                 f"exttest/{metric_prefix}_min_accuracy": min_accuracy,
                 f"exttest/{metric_prefix}_max_accuracy": max_accuracy,
                 f"exttest/{metric_prefix}_mean_accuracy": mean_accuracy,
-                f"exttest/{metric_prefix}_accuracy_range": max_accuracy - min_accuracy,
+                f"exttest/{metric_prefix}_accuracy_range": max_accuracy
+                - min_accuracy,
                 f"exttest/best_performing_{metric_prefix}": best_category,
                 f"exttest/worst_performing_{metric_prefix}": worst_category,
-                f"exttest/{metric_prefix}_categories_evaluated": len(category_accuracies),
-                "train/global_step": global_step
+                f"exttest/{metric_prefix}_categories_evaluated": len(
+                    category_accuracies
+                ),
+                "train/global_step": global_step,
             }
 
             if len(category_accuracies) > 1:
-                summary_metrics[f"exttest/{metric_prefix}_accuracy_std"] = np.std(list(category_accuracies.values()))
+                summary_metrics[f"exttest/{metric_prefix}_accuracy_std"] = (
+                    np.std(list(category_accuracies.values()))
+                )
 
             wandb.log(summary_metrics)
 
-            category_type = metric_prefix.replace('_', ' ')
+            category_type = metric_prefix.replace("_", " ")
             log.info(f"{category_type.capitalize()} performance summary:")
-            log.info(f"  Best performing {category_type}: {best_category} ({category_accuracies[best_category]:.4f})")
             log.info(
-                f"  Worst performing {category_type}: {worst_category} ({category_accuracies[worst_category]:.4f})")
-            log.info(f"  Mean accuracy across {category_type}s: {mean_accuracy:.4f}")
+                f"  Best performing {category_type}: {best_category} ({category_accuracies[best_category]:.4f})"
+            )
+            log.info(
+                f"  Worst performing {category_type}: {worst_category} ({category_accuracies[worst_category]:.4f})"
+            )
+            log.info(
+                f"  Mean accuracy across {category_type}s: {mean_accuracy:.4f}"
+            )
             log.info(f"  Accuracy range: {max_accuracy - min_accuracy:.4f}")
 
         if category_metrics:
-            total_samples = sum(len(data['labels']) for data in category_metrics.values())
+            total_samples = sum(
+                len(data["labels"]) for data in category_metrics.values()
+            )
             distribution_metrics = {
-                f"exttest/{metric_prefix}_{category}_percentage": (len(
-                    category_metrics[category]['labels']) / total_samples) * 100
+                f"exttest/{metric_prefix}_{category}_percentage": (
+                    len(category_metrics[category]["labels"]) / total_samples
+                )
+                * 100
                 for category in category_metrics.keys()
             }
             distribution_metrics["train/global_step"] = global_step
@@ -642,7 +760,9 @@ def final_evaluate(trainer, dataset, split_name):
     log.info(f"Evaluating on {split_name} set...")
     metrics = trainer.evaluate(eval_dataset=dataset)
 
-    predictions, labels, probs, preds = get_predictions_and_labels(trainer, dataset)
+    predictions, labels, probs, preds = get_predictions_and_labels(
+        trainer, dataset
+    )
 
     wandb_metrics = {
         f"final/{split_name}_accuracy": metrics["eval_accuracy"],
@@ -668,15 +788,15 @@ def do_training_run(run_name_suffix: str):
         raise ValueError("WANDB_API_KEY environment variable not set")
 
     wandb_run = wandb.init(
-        project="speech-endpointing",
-        name=run_name,
-        config=CONFIG
+        project="speech-endpointing", name=run_name, config=CONFIG
     )
 
     wandb_run.define_metric(name="exttest/*", step_metric="train/global_step")
 
-    model = SmartTurnV3Model.from_pretrained(CONFIG["base_model_name"], num_labels=1, ignore_mismatched_sizes=True)
-    feature_extractor = WhisperFeatureExtractor(chunk_length=8) # 8 seconds
+    model = SmartTurnV3Model.from_pretrained(
+        CONFIG["base_model_name"], num_labels=1, ignore_mismatched_sizes=True
+    )
+    feature_extractor = WhisperFeatureExtractor(chunk_length=8)  # 8 seconds
 
     log_model_structure(model, CONFIG)
 
@@ -724,13 +844,14 @@ def do_training_run(run_name_suffix: str):
         data_collator=SmartTurnDataCollator(),
         callbacks=[
             ProgressLoggerCallback(log_interval=CONFIG["logging_steps"])
-        ]
+        ],
     )
 
-    trainer.add_callback(ExternalEvaluationCallback(
-        test_datasets=datasets["test"],
-        trainer=trainer
-    ))
+    trainer.add_callback(
+        ExternalEvaluationCallback(
+            test_datasets=datasets["test"], trainer=trainer
+        )
+    )
 
     log.info("Starting training...")
     trainer.train()
@@ -748,9 +869,13 @@ def do_training_run(run_name_suffix: str):
 
     trainer.model.eval().cpu()
 
-    onnx_fp32_model_path = export_to_onnx_fp32(trainer.model, onnx_fp32_path, CONFIG)
+    onnx_fp32_model_path = export_to_onnx_fp32(
+        trainer.model, onnx_fp32_path, CONFIG
+    )
 
-    log.info(f"Training and export completed. Models saved to: {final_save_path}")
+    log.info(
+        f"Training and export completed. Models saved to: {final_save_path}"
+    )
 
     wandb.finish()
 
@@ -760,7 +885,9 @@ def do_training_run(run_name_suffix: str):
 def do_quantization_run(fp32_model_path: str):
     calibration_dataset_size = CONFIG["calibration_dataset_size"]
 
-    log.info(f"Starting quantization run on {fp32_model_path} (calib dataset size {calibration_dataset_size})")
+    log.info(
+        f"Starting quantization run on {fp32_model_path} (calib dataset size {calibration_dataset_size})"
+    )
 
     feature_extractor = WhisperFeatureExtractor(chunk_length=8)  # 8 seconds
 
@@ -773,7 +900,7 @@ def do_quantization_run(fp32_model_path: str):
         training_dataset=datasets["training"],
         feature_extractor=feature_extractor,
         exports_path=parent_dir,
-        calibration_dataset_size=calibration_dataset_size
+        calibration_dataset_size=calibration_dataset_size,
     )
 
     return quantized_onnx_path
@@ -784,7 +911,9 @@ def do_benchmark_run(model_paths: List[str]):
 
     feature_extractor = WhisperFeatureExtractor(chunk_length=8)  # 8 seconds
 
-    dataset = prepare_datasets_ondemand(feature_extractor, CONFIG)["test_merged"]
+    dataset = prepare_datasets_ondemand(feature_extractor, CONFIG)[
+        "test_merged"
+    ]
 
     for model_path in model_paths:
         model_name = os.path.basename(model_path).replace(".onnx", "")
@@ -797,5 +926,5 @@ def do_benchmark_run(model_paths: List[str]):
             dataset=dataset,
             limit=None,
             markdown_output=f"{benchmark_path}/{model_name}.md",
-            batch_size=256
+            batch_size=256,
         )
