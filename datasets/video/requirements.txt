@@ -1,0 +1,7 @@
+pyannote.audio 
+faster-whisper 
+moviepy 
+torch 
+pandas
+soundfile 
+torchaudio
