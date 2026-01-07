@@ -22,16 +22,16 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import IntervalStrategy
 from transformers.training_args import TrainingArguments
 
+from audio_utils import truncate_audio_to_last_n_seconds
 from benchmark import benchmark
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from logger import log, log_model_structure, log_dataset_statistics, log_dependencies, ProgressLoggerCallback
 
 CONFIG = {
-    "run_name_prefix": "v3.1",
     "base_model_name": "openai/whisper-tiny",
 
-    "datasets_training": ["smart-turn-data-v3.1-train"],
-    "datasets_test": ["smart-turn-data-v3.1-test"],
+    "datasets_training": ["pipecat-ai/smart-turn-data-v3.2-train"],
+    "datasets_test": ["pipecat-ai/smart-turn-data-v3.2-test"],
 
     "learning_rate": 5e-5,
     "num_epochs": 4,
@@ -307,13 +307,6 @@ def load_dataset_at(path: str):
         return load_from_disk(path)["train"]
     else:
         return load_dataset(path)["train"]
-
-
-def truncate_audio_to_last_n_seconds(audio_array, n_seconds=8, sample_rate=16000):
-    max_samples = n_seconds * sample_rate
-    if len(audio_array) > max_samples:
-        return audio_array[-max_samples:]
-    return audio_array
 
 
 class OnDemandSmartTurnDataset(Dataset):
@@ -656,10 +649,8 @@ def final_evaluate(trainer, dataset, split_name):
     return metrics, predictions
 
 
-def do_training_run(run_name_suffix: str):
+def do_training_run(run_name: str):
     log_dependencies()
-
-    run_name = CONFIG["run_name_prefix"] + "-" + run_name_suffix
 
     log.info(f"Starting training run: {run_name}")
 

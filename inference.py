@@ -2,6 +2,8 @@ import numpy as np
 import onnxruntime as ort
 from transformers import WhisperFeatureExtractor
 
+from audio_utils import truncate_audio_to_last_n_seconds
+
 ONNX_MODEL_PATH = "smart-turn-v3.1.onnx"
 
 def build_session(onnx_path):
@@ -13,17 +15,6 @@ def build_session(onnx_path):
 
 feature_extractor = WhisperFeatureExtractor(chunk_length=8)
 session = build_session(ONNX_MODEL_PATH)
-
-def truncate_audio_to_last_n_seconds(audio_array, n_seconds=8, sample_rate=16000):
-    """Truncate audio to last n seconds or pad with zeros to meet n seconds."""
-    max_samples = n_seconds * sample_rate
-    if len(audio_array) > max_samples:
-        return audio_array[-max_samples:]
-    elif len(audio_array) < max_samples:
-        # Pad with zeros at the beginning
-        padding = max_samples - len(audio_array)
-        return np.pad(audio_array, (padding, 0), mode='constant', constant_values=0)
-    return audio_array
 
 
 def predict_endpoint(audio_array):
