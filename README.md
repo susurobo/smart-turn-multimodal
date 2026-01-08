@@ -1,4 +1,4 @@
-# Smart Turn v3.1
+# Smart Turn v3.2
 
 An open source, community-driven, native audio turn detection model.
 
@@ -77,7 +77,7 @@ For more information, see the Pipecat documentation:
 
 https://docs.pipecat.ai/server/utilities/smart-turn/smart-turn-overview
 
-Smart Turn v3.1 has been extensively tested on Pipecat Cloud, with inference completing in around 65ms on a standard 1x instance when using `LocalSmartTurnAnalyzerV3`.
+Smart Turn v3 has been extensively tested on [Pipecat Cloud](https://www.daily.co/products/pipecat-cloud/), with inference completing in around 65ms on a standard 1x instance when using `LocalSmartTurnAnalyzerV3`.
 
 ### With local inference
 
@@ -85,26 +85,13 @@ From the Smart Turn source repository, obtain the files `model.py` and `inferenc
 
 https://github.com/pipecat-ai/smart-turn/blob/main/predict.py
 
-### With Fal hosted inference
-
-[Fal](https://fal.ai/) provides a hosted Smart Turn endpoint.
-
-https://fal.ai/models/fal-ai/smart-turn/api
-
-Please see the link above for documentation, or try the sample `curl` command below.
-
-```bash
-curl -X POST --url https://fal.run/fal-ai/smart-turn \
-    --header "Authorization: Key $FAL_KEY" \
-    --header "Content-Type: application/json" \
-    --data '{ "audio_url": "https://fal.media/files/panda/5-QaAOC32rB_hqWaVdqEH.mpga" }'
-```
-
 ### Notes on input format
 
 Smart Turn takes 16kHz mono PCM audio as input. Up to 8 seconds of audio is supported, and we recommend providing the full audio of the user's current turn.
 
 The model is designed to be used in conjunction with a lightweight VAD model such as Silero. Once the VAD model detects silence, run Smart Turn on the entire recording of the user's turn, truncating from the beginning to shorten the audio to around 8 seconds if necessary.
+
+If the input data is shorter than 8 seconds, insert padding at the beginning to make up the remaining length, such that the audio data is at the end of the input vector, and the padding zeroes are at the beginning.
 
 If additional speech is detected from the user before Smart Turn has finished executing, re-run Smart Turn on the entire turn recording, including the new audio, rather than just the new segment. Smart Turn works best when given sufficient context, and is not designed to run on very short audio segments.
 
@@ -155,8 +142,8 @@ modal run --detach train_modal.py
 
 Currently, the following datasets are used for training and evaluation:
 
-* pipecat-ai/smart-turn-data-v3.1-train
-* pipecat-ai/smart-turn-data-v3.1-test
+* pipecat-ai/smart-turn-data-v3.2-train
+* pipecat-ai/smart-turn-data-v3.2-test
 
 ## Things to do
 
