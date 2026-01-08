@@ -33,6 +33,7 @@ image = (
     .add_local_python_source("logger")
     .add_local_python_source("train")
     .add_local_python_source("benchmark")
+    .add_local_python_source("audio_utils")
 )
 
 
@@ -45,9 +46,9 @@ image = (
     timeout=86400,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
-def training_run(run_name_suffix: str):
+def training_run(run_name: str):
     import train
-    return train.do_training_run(run_name_suffix=run_name_suffix)
+    return train.do_training_run(run_name=run_name)
 
 
 @app.function(
@@ -82,15 +83,12 @@ def benchmark_run(model_root: List[str]):
 
 @app.local_entrypoint()
 def main(
-        run_number: Optional[str] = None,
+        training_run_name: Optional[str] = None,
         quantize: Optional[str] = None,
         benchmark: Optional[str] = None
 ):
-    if run_number is not None:
-        now = datetime.now().strftime("%Y-%m-%d_%H:%M")
-        run_name_suffix = f"{now}_run{run_number}"
-
-        training_run.remote(run_name_suffix)
+    if training_run_name is not None:
+        training_run.remote(run_name=training_run_name)
 
     if quantize is not None:
         quantization_run.remote(fp32_model_path=quantize)

@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional
 
 import modal
 import numpy as np
@@ -235,6 +235,57 @@ def format_language_name(lang_code: str) -> str:
     return LANGUAGE_MAPPING.get(lang_code, lang_code)
 
 
+class MarkdownTable:
+    """Render a padded/aligned Markdown table (monospace-friendly)."""
+
+    def __init__(self, headers: List[str], align: Optional[List[str]] = None):
+        self.headers = [str(h) for h in headers]
+        self.rows: List[List[str]] = []
+        self.align = align or ["left"] * len(self.headers)
+        if len(self.align) != len(self.headers):
+            raise ValueError("align must match headers length")
+
+    def add_row(self, row: List[Any]) -> None:
+        if len(row) != len(self.headers):
+            raise ValueError("row must match headers length")
+        self.rows.append(["" if v is None else str(v) for v in row])
+
+    @staticmethod
+    def _separator_cell(width: int, align: str) -> str:
+        width = max(3, width)
+        if align == "left":
+            return ":" + ("-" * (width - 1))
+        if align == "right":
+            return ("-" * (width - 1)) + ":"
+        if align == "center":
+            return ":" + ("-" * (width - 2)) + ":"
+        return "-" * width
+
+    def render(self) -> str:
+        widths = [max(3, len(h)) for h in self.headers]
+        for row in self.rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        def _format_row(cells: List[str]) -> str:
+            padded: List[str] = []
+            for i, cell in enumerate(cells):
+                if self.align[i] == "right":
+                    padded.append(cell.rjust(widths[i]))
+                elif self.align[i] == "center":
+                    padded.append(cell.center(widths[i]))
+                else:
+                    padded.append(cell.ljust(widths[i]))
+            return "| " + " | ".join(padded) + " |"
+
+        header_line = _format_row(self.headers)
+        sep_line = "| " + " | ".join(
+            self._separator_cell(widths[i], self.align[i]) for i in range(len(widths))
+        ) + " |"
+        body_lines = [_format_row(r) for r in self.rows]
+        return "\n".join([header_line, sep_line] + body_lines)
+
+
 def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
     """Format the results into a comprehensive Markdown report."""
     md_lines = []
@@ -257,18 +308,30 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
 
         # Overall Accuracy Table
         md_lines.append("\n### Overall Performance")
-        md_lines.append("| Metric | Sample Count | Accuracy (%) | False Positives (%) | False Negatives (%) |")
-        md_lines.append("|--------|--------------|--------------|---------------------|---------------------|")
-
         overall = acc_data["overall"]
-        md_lines.append(
-            f"| Overall | {overall['sample_count']:,} | {overall['accuracy']:.2f} | {overall['false_positive_rate']:.2f} | {overall['false_negative_rate']:.2f} |")
+        overall_tbl = MarkdownTable(
+            headers=["Metric", "Sample Count", "Accuracy (%)", "Precision", "Recall", "F1", "FPR (%)", "FNR (%)"],
+            align=["left", "right", "right", "right", "right", "right", "right", "right"],
+        )
+        overall_tbl.add_row([
+            "Overall",
+            f"{overall['sample_count']:,}",
+            f"{overall['accuracy']:.2f}",
+            f"{overall['precision']:.3f}",
+            f"{overall['recall']:.3f}",
+            f"{overall['f1']:.3f}",
+            f"{overall['false_positive_rate']:.2f}",
+            f"{overall['false_negative_rate']:.2f}",
+        ])
+        md_lines.append("\n" + overall_tbl.render())
 
         # Per-Language Accuracy Table
         if "per_language" in acc_data and acc_data["per_language"]:
             md_lines.append("\n### Performance by Language")
-            md_lines.append("| Language | Sample Count | Accuracy (%) | False Positives (%) | False Negatives (%) |")
-            md_lines.append("|----------|--------------|--------------|---------------------|---------------------|")
+            lang_tbl = MarkdownTable(
+                headers=["Language", "Sample Count", "Accuracy (%)", "Precision", "Recall", "F1", "FPR (%)", "FNR (%)"],
+                align=["left", "right", "right", "right", "right", "right", "right", "right"],
+            )
 
             # Sort languages by accuracy in descending order
             sorted_languages = sorted(acc_data["per_language"].keys(), 
@@ -278,14 +341,25 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
             for lang in sorted_languages:
                 metrics = acc_data["per_language"][lang]
                 formatted_lang = format_language_name(lang)
-                md_lines.append(
-                    f"| {formatted_lang} | {metrics['sample_count']:,} | {metrics['accuracy']:.2f} | {metrics['false_positive_rate']:.2f} | {metrics['false_negative_rate']:.2f} |")
+                lang_tbl.add_row([
+                    formatted_lang,
+                    f"{metrics['sample_count']:,}",
+                    f"{metrics['accuracy']:.2f}",
+                    f"{metrics['precision']:.3f}",
+                    f"{metrics['recall']:.3f}",
+                    f"{metrics['f1']:.3f}",
+                    f"{metrics['false_positive_rate']:.2f}",
+                    f"{metrics['false_negative_rate']:.2f}",
+                ])
+            md_lines.append("\n" + lang_tbl.render())
 
         # Per-Dataset Accuracy Table
         if "per_dataset" in acc_data and acc_data["per_dataset"]:
             md_lines.append("\n### Performance by Dataset")
-            md_lines.append("| Dataset | Sample Count | Accuracy (%) | False Positives (%) | False Negatives (%) |")
-            md_lines.append("|---------|--------------|--------------|---------------------|---------------------|")
+            ds_tbl = MarkdownTable(
+                headers=["Dataset", "Sample Count", "Accuracy (%)", "Precision", "Recall", "F1", "FPR (%)", "FNR (%)"],
+                align=["left", "right", "right", "right", "right", "right", "right", "right"],
+            )
 
             # Sort datasets by accuracy in descending order
             sorted_datasets = sorted(acc_data["per_dataset"].keys(), 
@@ -294,8 +368,17 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
             
             for dataset in sorted_datasets:
                 metrics = acc_data["per_dataset"][dataset]
-                md_lines.append(
-                    f"| {dataset} | {metrics['sample_count']:,} | {metrics['accuracy']:.2f} | {metrics['false_positive_rate']:.2f} | {metrics['false_negative_rate']:.2f} |")
+                ds_tbl.add_row([
+                    dataset,
+                    f"{metrics['sample_count']:,}",
+                    f"{metrics['accuracy']:.2f}",
+                    f"{metrics['precision']:.3f}",
+                    f"{metrics['recall']:.3f}",
+                    f"{metrics['f1']:.3f}",
+                    f"{metrics['false_positive_rate']:.2f}",
+                    f"{metrics['false_negative_rate']:.2f}",
+                ])
+            md_lines.append("\n" + ds_tbl.render())
 
     # Performance Results
     md_lines.append("\n## Inference Performance")
@@ -303,49 +386,78 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
     # Direct Inference (pre-computed features)
     md_lines.append("\n### Direct Inference Performance")
     md_lines.append("*Using pre-computed zero features (inference only)*")
-    md_lines.append(
-        "\n| Provider | P50 Latency (ms) | P90 Latency (ms) | Mean Latency (ms) | Throughput (samples/sec) |")
-    md_lines.append("|----------|------------------|------------------|-------------------|--------------------------|")
+    direct_tbl = MarkdownTable(
+        headers=["Provider", "P50 Latency (ms)", "P90 Latency (ms)", "Mean Latency (ms)", "Throughput (samples/sec)"],
+        align=["left", "right", "right", "right", "right"],
+    )
 
     if "perf_cpu" in results:
         cpu_perf = results["perf_cpu"]
-        md_lines.append(
-            f"| CPU | {cpu_perf['latency_ms_p50']:.2f} | {cpu_perf['latency_ms_p90']:.2f} | {cpu_perf['latency_ms_mean']:.2f} | {cpu_perf['throughput_sps']:.1f} |")
+        direct_tbl.add_row([
+            "CPU",
+            f"{cpu_perf['latency_ms_p50']:.2f}",
+            f"{cpu_perf['latency_ms_p90']:.2f}",
+            f"{cpu_perf['latency_ms_mean']:.2f}",
+            f"{cpu_perf['throughput_sps']:.1f}",
+        ])
 
     if "perf_gpu" in results and "note" not in results["perf_gpu"]:
         gpu_perf = results["perf_gpu"]
-        md_lines.append(
-            f"| {gpu_model_name} | {gpu_perf['latency_ms_p50']:.2f} | {gpu_perf['latency_ms_p90']:.2f} | {gpu_perf['latency_ms_mean']:.2f} | {gpu_perf['throughput_sps']:.1f} |")
+        direct_tbl.add_row([
+            gpu_model_name,
+            f"{gpu_perf['latency_ms_p50']:.2f}",
+            f"{gpu_perf['latency_ms_p90']:.2f}",
+            f"{gpu_perf['latency_ms_mean']:.2f}",
+            f"{gpu_perf['throughput_sps']:.1f}",
+        ])
+    md_lines.append("\n" + direct_tbl.render())
 
     # Feature Extraction Performance
     if "perf_feature_extractor" in results:
         md_lines.append("\n### Feature Extraction Performance")
         md_lines.append("*Whisper feature extraction from 8-second audio*")
-        md_lines.append(
-            "\n| Component | P50 Latency (ms) | P90 Latency (ms) | Mean Latency (ms) | Throughput (samples/sec) |")
-        md_lines.append(
-            "|-----------|------------------|------------------|-------------------|--------------------------|")
-
         fe_perf = results["perf_feature_extractor"]
-        md_lines.append(
-            f"| Feature Extractor | {fe_perf['latency_ms_p50']:.2f} | {fe_perf['latency_ms_p90']:.2f} | {fe_perf['latency_ms_mean']:.2f} | {fe_perf['throughput_sps']:.1f} |")
+        fe_tbl = MarkdownTable(
+            headers=["Component", "P50 Latency (ms)", "P90 Latency (ms)", "Mean Latency (ms)", "Throughput (samples/sec)"],
+            align=["left", "right", "right", "right", "right"],
+        )
+        fe_tbl.add_row([
+            "Feature Extractor",
+            f"{fe_perf['latency_ms_p50']:.2f}",
+            f"{fe_perf['latency_ms_p90']:.2f}",
+            f"{fe_perf['latency_ms_mean']:.2f}",
+            f"{fe_perf['throughput_sps']:.1f}",
+        ])
+        md_lines.append("\n" + fe_tbl.render())
 
     # End-to-End Performance
     md_lines.append("\n### End-to-End Performance")
     md_lines.append("*Feature extraction + inference from raw audio*")
-    md_lines.append(
-        "\n| Provider | P50 Latency (ms) | P90 Latency (ms) | Mean Latency (ms) | Throughput (samples/sec) |")
-    md_lines.append("|----------|------------------|------------------|-------------------|--------------------------|")
+    e2e_tbl = MarkdownTable(
+        headers=["Provider", "P50 Latency (ms)", "P90 Latency (ms)", "Mean Latency (ms)", "Throughput (samples/sec)"],
+        align=["left", "right", "right", "right", "right"],
+    )
 
     if "perf_e2e_cpu" in results:
         e2e_cpu = results["perf_e2e_cpu"]
-        md_lines.append(
-            f"| CPU | {e2e_cpu['latency_ms_p50']:.2f} | {e2e_cpu['latency_ms_p90']:.2f} | {e2e_cpu['latency_ms_mean']:.2f} | {e2e_cpu['throughput_sps']:.1f} |")
+        e2e_tbl.add_row([
+            "CPU",
+            f"{e2e_cpu['latency_ms_p50']:.2f}",
+            f"{e2e_cpu['latency_ms_p90']:.2f}",
+            f"{e2e_cpu['latency_ms_mean']:.2f}",
+            f"{e2e_cpu['throughput_sps']:.1f}",
+        ])
 
     if "perf_e2e_gpu" in results and "note" not in results["perf_e2e_gpu"]:
         e2e_gpu = results["perf_e2e_gpu"]
-        md_lines.append(
-            f"| {gpu_model_name} | {e2e_gpu['latency_ms_p50']:.2f} | {e2e_gpu['latency_ms_p90']:.2f} | {e2e_gpu['latency_ms_mean']:.2f} | {e2e_gpu['throughput_sps']:.1f} |")
+        e2e_tbl.add_row([
+            gpu_model_name,
+            f"{e2e_gpu['latency_ms_p50']:.2f}",
+            f"{e2e_gpu['latency_ms_p90']:.2f}",
+            f"{e2e_gpu['latency_ms_mean']:.2f}",
+            f"{e2e_gpu['throughput_sps']:.1f}",
+        ])
+    md_lines.append("\n" + e2e_tbl.render())
 
     # Add notes about any skipped measurements
     notes = []
