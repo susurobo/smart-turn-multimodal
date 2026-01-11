@@ -336,7 +336,36 @@ def run_multimodal_training(
     # (Or mix them fully. Here we concatenate everything).
     full_dataset = concatenate_datasets([video_dataset, audio_only_dataset])
 
+    # 4. Merge & Split with OVERSAMPLING
+
+    # Calculate how many times we need to repeat the video dataset
+    # to make it roughly 10% of the total size.
+    total_audio = len(audio_only_dataset)  # ~270,000
+    total_video = len(video_dataset)  # ~22
+
+    # Target: We want ~30,000 video samples (10% of 270k)
+    # 22 * X = 30,000  =>  X = ~1300
+    if total_video > 0:
+        repeat_factor = int((total_audio * 0.1) / total_video)
+        repeat_factor = max(1, repeat_factor)
+
+        log.info(
+            f"Oversampling video dataset {repeat_factor} times to balance training..."
+        )
+
+        # Create a list of the dataset repeated N times
+        video_datasets_list = [video_dataset] * repeat_factor
+        balanced_video_dataset = concatenate_datasets(video_datasets_list)
+    else:
+        balanced_video_dataset = video_dataset
+
+    # Now concatenate the massive audio set with the boosted video set
+    full_dataset = concatenate_datasets(
+        [balanced_video_dataset, audio_only_dataset]
+    )
+
     # Create Train/Test Split (90/10)
+    # SHUFFLE IS CRITICAL here so the repeated videos are spread out
     # We shuffle to ensure batches contain a mix of Audio-Only and Audio-Video samples
     split = full_dataset.train_test_split(test_size=0.1, seed=42, shuffle=True)
 

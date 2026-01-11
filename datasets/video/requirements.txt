@@ -5,3 +5,6 @@ torch
 pandas
 soundfile 
 torchaudio
+facenet-pytorch 
+opencv-python
+simple-term-menu
