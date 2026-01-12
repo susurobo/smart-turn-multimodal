@@ -12,6 +12,7 @@ from transformers import (
     TrainingArguments,
 )
 
+from safetensors.torch import load_file
 from torchvision.models.video import r3d_18, R3D_18_Weights
 from datasets import load_dataset, concatenate_datasets
 
@@ -175,21 +176,17 @@ class OnDemandMultimodalDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def _load_video_frames(self, rel_path):
-        """Loads last 32 frames of video, resizes to 112x112"""
-        # --- FIX: Handle missing video paths safely ---
+        """Loads last 32 frames. If shorter (but >8), pads with zeros."""
         if rel_path is None:
             return None
 
-        # Handle absolute paths vs relative paths
         if os.path.isabs(rel_path):
             full_path = rel_path
         else:
             full_path = os.path.join(self.dataset_root, rel_path)
 
         if not os.path.exists(full_path):
-            log.warning(f"Video file not found: {full_path}")
             return None
-        # ----------------------------------------------
 
         try:
             container = av.open(full_path)
@@ -199,33 +196,41 @@ class OnDemandMultimodalDataset(torch.utils.data.Dataset):
             for frame in container.decode(stream):
                 frames.append(frame)
 
-            # Take last 32 frames (approx 1 sec at 30fps)
+            # 1. Take last 32 frames
             clip = frames[-32:]
 
-            if len(clip) < 8:  # Too short to be useful
+            # 2. Safety Check (keep your existing check)
+            if len(clip) < 8:
                 return None
 
-            # Convert to Tensor [T, H, W, C] -> [C, T, H, W]
+            # 3. Process to Tensor
             tensors = []
             for frame in clip:
-                img = frame.to_image().resize(
-                    (112, 112)
-                )  # Resize small for R3D-18
+                img = frame.to_image().resize((112, 112))
                 t_img = torch.from_numpy(np.array(img)).float() / 255.0
                 tensors.append(t_img)
 
-            video = torch.stack(tensors)
-            video = video.permute(3, 0, 1, 2)
+            video = torch.stack(tensors)  # [T, H, W, C]
+            video = video.permute(3, 0, 1, 2)  # [C, T, H, W]
 
             # Normalize
             video = (video - self.mean[:, None, None, None]) / self.std[
                 :, None, None, None
             ]
 
-            return video  # [3, 32, 112, 112]
+            # --- NEW: PADDING LOGIC ---
+            # If we have fewer than 32 frames, pad the Time dimension (dim=1)
+            # F.pad format for 4D input: (W_left, W_right, H_top, H_bottom, T_front, T_back)
+            if video.shape[1] < 32:
+                pad_amt = 32 - video.shape[1]
+                # Pad the END of the temporal dimension with zeros
+                video = torch.nn.functional.pad(video, (0, 0, 0, 0, 0, pad_amt))
+            # --------------------------
+
+            return video  # Guaranteed [3, 32, 112, 112]
 
         except Exception as e:
-            log.warning(f"Failed to load video {rel_path}: {e}")
+            # log.warning(f"Failed to load video {rel_path}: {e}")
             return None
 
     def __getitem__(self, idx):
@@ -291,32 +296,84 @@ class MultimodalCollator:
 def run_multimodal_training(
     dataset_path: str,
     run_name: str,
-    # Add a default, but allow overriding
     base_model_path: str = "openai/whisper-tiny",
 ):
-    # 1. Setup Config & Feature Extractor
-    # We start from the base Whisper model since v3 weights are ONNX-only
+    # --- SETUP CONFIG & DATASETS (Same as before) ---
     config = WhisperConfig.from_pretrained("openai/whisper-tiny")
     feature_extractor = WhisperFeatureExtractor(chunk_length=8)
 
-    # 2. Load Datasets
     log.info("Loading datasets...")
 
-    # A. Your Video Dataset (Uploaded to Modal Volume)
-    # The 'data_dir' argument tells audiofolder where to look
+    # A. Load Video Dataset
     video_dataset = load_dataset(
         "audiofolder", data_dir=dataset_path, split="train"
     )
 
-    # B. The Official Smart Turn Audio Dataset (From Hugging Face)
-    # We use the official training data so the model retains its core accuracy
+    # --- NEW LOGIC: FILTER & INTERNAL BALANCE (OPTIMIZED) ---
+
+    # 1. Filter out Junk (NULL endpoint_bool)
+    initial_count = len(video_dataset)
+
+    # PASS 'input_columns' TO AVOID DECODING AUDIO
+    # When input_columns="endpoint_bool", 'x' becomes the boolean value itself, not the whole row.
+    video_dataset = video_dataset.filter(
+        lambda x: x is not None, input_columns="endpoint_bool"
+    )
+
+    filtered_count = len(video_dataset)
+    log.info(
+        f"Video Filtering: Dropped {initial_count - filtered_count} samples. Keeping {filtered_count}."
+    )
+
+    # 2. Balance Positive vs Negative Video Samples
+    # Again, use input_columns to stay fast
+    pos_video = video_dataset.filter(
+        lambda x: x is True, input_columns="endpoint_bool"
+    )
+    neg_video = video_dataset.filter(
+        lambda x: x is False, input_columns="endpoint_bool"
+    )
+
+    pos_count = len(pos_video)
+    neg_count = len(neg_video)
+
+    log.info(
+        f"Video Balance Check: {pos_count} Positives vs {neg_count} Negatives."
+    )
+
+    if pos_count > 0 and neg_count > 0:
+        # Determine which is the minority class
+        if pos_count < neg_count:
+            # Positives are minority (typical case)
+            ratio = int(neg_count / pos_count)
+            if ratio > 1:
+                log.info(
+                    f"Balancing Video: Upsampling POSITIVES by {ratio}x to match Negatives."
+                )
+                balanced_part = concatenate_datasets([pos_video] * ratio)
+                video_dataset = concatenate_datasets([balanced_part, neg_video])
+        elif neg_count < pos_count:
+            # Negatives are minority (unlikely, but handled)
+            ratio = int(pos_count / neg_count)
+            if ratio > 1:
+                log.info(
+                    f"Balancing Video: Upsampling NEGATIVES by {ratio}x to match Positives."
+                )
+                balanced_part = concatenate_datasets([neg_video] * ratio)
+                video_dataset = concatenate_datasets([balanced_part, pos_video])
+
+        # Shuffle internally so the oversampled data is mixed
+        video_dataset = video_dataset.shuffle(seed=42)
+        log.info(f"New Internal Video Size: {len(video_dataset)}")
+
+    # --------------------------------------------
+
+    # B. Load Audio Dataset
     audio_only_dataset = load_dataset(
         "pipecat-ai/smart-turn-data-v3.2-train", split="train"
     )
 
-    # 3. Align Columns for Concatenation
-    # The audio dataset doesn't have 'video_path', so we add it as None
-    # This allows us to merge them seamlessly.
+    # 3. Align Columns
     def add_missing_columns(example):
         example["video_path"] = None
         example["visual_label"] = None
@@ -324,55 +381,38 @@ def run_multimodal_training(
 
     audio_only_dataset = audio_only_dataset.map(add_missing_columns)
 
-    # Ensure both have the same set of columns before merging
-    # We select only the columns our loader cares about
     common_columns = ["audio", "endpoint_bool", "video_path"]
-
     video_dataset = video_dataset.select_columns(common_columns)
     audio_only_dataset = audio_only_dataset.select_columns(common_columns)
 
-    # 4. Merge & Split
-    # We use 100% of video data for training + a portion of audio data
-    # (Or mix them fully. Here we concatenate everything).
-    full_dataset = concatenate_datasets([video_dataset, audio_only_dataset])
+    # 4. Global Oversampling (Video vs Audio)
+    # Now we ensure the (internally balanced) video dataset makes up ~10% of total training data
+    total_audio = len(audio_only_dataset)
+    total_video = len(video_dataset)
 
-    # 4. Merge & Split with OVERSAMPLING
-
-    # Calculate how many times we need to repeat the video dataset
-    # to make it roughly 10% of the total size.
-    total_audio = len(audio_only_dataset)  # ~270,000
-    total_video = len(video_dataset)  # ~22
-
-    # Target: We want ~30,000 video samples (10% of 270k)
-    # 22 * X = 30,000  =>  X = ~1300
     if total_video > 0:
-        repeat_factor = int((total_audio * 0.1) / total_video)
+        # Target ~10% of audio size
+        target_video_size = total_audio * 0.1
+        repeat_factor = int(target_video_size / total_video)
         repeat_factor = max(1, repeat_factor)
 
         log.info(
-            f"Oversampling video dataset {repeat_factor} times to balance training..."
+            f"Global Oversampling: Repeating video dataset {repeat_factor}x to reach 10% of Audio size."
         )
 
-        # Create a list of the dataset repeated N times
         video_datasets_list = [video_dataset] * repeat_factor
         balanced_video_dataset = concatenate_datasets(video_datasets_list)
     else:
         balanced_video_dataset = video_dataset
 
-    # Now concatenate the massive audio set with the boosted video set
+    # 5. Merge & Split
     full_dataset = concatenate_datasets(
         [balanced_video_dataset, audio_only_dataset]
     )
 
-    # Create Train/Test Split (90/10)
-    # SHUFFLE IS CRITICAL here so the repeated videos are spread out
-    # We shuffle to ensure batches contain a mix of Audio-Only and Audio-Video samples
+    # Shuffle is CRITICAL to mix Audio and Video chunks
     split = full_dataset.train_test_split(test_size=0.1, seed=42, shuffle=True)
 
-    # 5. Wrap in Multimodal Loader
-    # Note: dataset_root is only needed for the video_dataset part.
-    # Our loader handles absolute paths or relative paths.
-    # Since 'audio_only_dataset' entries have video_path=None, the loader will generate zero-tensors for them.
     train_ds = OnDemandMultimodalDataset(
         split["train"], feature_extractor, dataset_root=dataset_path
     )
@@ -380,23 +420,72 @@ def run_multimodal_training(
         split["test"], feature_extractor, dataset_root=dataset_path
     )
 
-    # 6. Initialize Model
-    # We load the PRETRAINED WHISPER weights (not SmartTurn v3 ONNX)
-    model = SmartTurnMultimodal(
-        config,
-        pretrained_audio_path=base_model_path,
-    )
+    # --- DEFINE PATHS ---
+    stage1_output_dir = f"/data/output/{run_name}/stage1_aligned"
+    stage2_output_dir = f"/data/output/{run_name}_stage2"
 
-    # --- STAGE 1: FREEZE AUDIO ---
-    # We still freeze audio initially to let the R3D-18 video encoder learn
-    # to output embeddings compatible with Whisper's latent space.
-    model.freeze_audio_branch()
+    # --- INITIALIZE MODEL ---
+    model = SmartTurnMultimodal(config, pretrained_audio_path=base_model_path)
 
-    args = TrainingArguments(
-        output_dir=f"/data/output/{run_name}",
+    # --- CHECK FOR EXISTING STAGE 1 CHECKPOINT ---
+    if os.path.exists(os.path.join(stage1_output_dir, "model.safetensors")):
+        log.info(
+            f"✅ Found completed Stage 1 checkpoint at {stage1_output_dir}"
+        )
+        log.info("Skipping Stage 1 training and loading weights...")
+
+        # Load the weights directly
+        state_dict = load_file(
+            os.path.join(stage1_output_dir, "model.safetensors")
+        )
+        model.load_state_dict(state_dict)
+
+    else:
+        # --- RUN STAGE 1 (If checkpoint missing) ---
+        log.info("No Stage 1 checkpoint found. Starting Stage 1 Training...")
+
+        model.freeze_audio_branch()
+
+        args_s1 = TrainingArguments(
+            output_dir=f"/data/output/{run_name}",
+            per_device_train_batch_size=32,
+            learning_rate=5e-4,  # High LR for Stage 1
+            num_train_epochs=1,
+            save_steps=200,
+            logging_steps=50,
+            report_to=["wandb"],
+            remove_unused_columns=False,
+            dataloader_num_workers=4,
+        )
+
+        trainer_s1 = Trainer(
+            model=model,
+            args=args_s1,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            data_collator=MultimodalCollator(),
+            compute_metrics=compute_metrics,
+        )
+
+        trainer_s1.train()
+        trainer_s1.save_model(stage1_output_dir)
+
+        # Free memory
+        del trainer_s1
+        torch.cuda.empty_cache()
+
+    # --- STAGE 2: JOINT FINETUNING ---
+    log.info("Starting Stage 2: Joint Finetuning...")
+
+    # 1. Unfreeze Everything
+    model.unfreeze_all()
+
+    # 2. Define FRESH Arguments for Stage 2 (Low LR)
+    args_s2 = TrainingArguments(
+        output_dir=stage2_output_dir,
         per_device_train_batch_size=32,
-        learning_rate=5e-4,
-        num_train_epochs=1,  # 1 Epoch is enough for alignment since we have mixed data
+        learning_rate=1e-5,  # <--- CRITICAL FIX: LOW LR
+        num_train_epochs=3,
         save_steps=200,
         logging_steps=50,
         report_to=["wandb"],
@@ -404,29 +493,15 @@ def run_multimodal_training(
         dataloader_num_workers=4,
     )
 
-    trainer = Trainer(
+    # 3. Create FRESH Trainer (Resets Optimizer)
+    trainer_s2 = Trainer(
         model=model,
-        args=args,
+        args=args_s2,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=MultimodalCollator(),
         compute_metrics=compute_metrics,
     )
 
-    log.info("Starting Stage 1: Alignment (Audio Frozen)...")
-    trainer.train()
-    trainer.save_model(f"/data/output/{run_name}/stage1_aligned")
-
-    # --- STAGE 2: JOINT FINETUNING ---
-    model.unfreeze_all()
-
-    args.learning_rate = 1e-5  # Very low LR to polish both modalities
-    args.num_train_epochs = 3
-    args.output_dir = f"/data/output/{run_name}_stage2"
-
-    # Update trainer args (hacky but works)
-    trainer.args = args
-
-    log.info("Starting Stage 2: Joint Finetuning...")
-    trainer.train()
-    trainer.save_model(f"/data/output/{run_name}/final_multimodal")
+    trainer_s2.train()
+    trainer_s2.save_model(f"/data/output/{run_name}/final_multimodal")

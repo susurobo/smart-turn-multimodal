@@ -62,9 +62,10 @@ image = (
 def multimodal_run(dataset_folder_name: str, run_name: str, base_model: str):
     import train_multimodal
 
+    old_run_name = "mm_run_20260111_1904"
     train_multimodal.run_multimodal_training(
         dataset_path=f"/data/datasets/{dataset_folder_name}",
-        run_name=run_name,
+        run_name=old_run_name,
         base_model_path=base_model,  # Pass it through
     )
 
