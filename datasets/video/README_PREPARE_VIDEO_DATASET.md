@@ -246,3 +246,11 @@ ffmpeg -version
 - Uses GPU for face detection if CUDA is available
 - Progress bars show ETA for both video-level and segment-level processing
 - Typical speed: ~5-10 seconds per video (varies by video length and hardware)
+
+
+
+
+# sequence
+
+python prepare_video_dataset.py ~/susurobo/data/fb_casual_conv/mini/test  ./smart_turn_multimodal_test_dataset --silence-ms 200
+

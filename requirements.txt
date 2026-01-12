@@ -13,3 +13,5 @@ pyaudio
 torchaudio
 onnx
 onnxruntime
+flask
+flask-socketio

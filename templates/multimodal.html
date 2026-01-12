@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Turn - Multimodal Demo</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a24;
+            --accent-cyan: #00d4ff;
+            --accent-magenta: #ff0080;
+            --accent-green: #00ff88;
+            --accent-red: #ff4444;
+            --text-primary: #ffffff;
+            --text-secondary: #8888aa;
+            --border-color: #2a2a3a;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            background-image: 
+                radial-gradient(ellipse at 20% 20%, rgba(0, 212, 255, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, rgba(255, 0, 128, 0.08) 0%, transparent 50%);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1rem;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 2rem;
+        }
+
+        @media (max-width: 900px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+        }
+
+        .card-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+        }
+
+        /* Video Section */
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            aspect-ratio: 4/3;
+        }
+
+        #webcam {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        .video-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 1rem;
+            background: linear-gradient(transparent, rgba(0,0,0,0.8));
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+            transition: all 0.2s;
+        }
+
+        .status-dot.listening {
+            background: var(--accent-cyan);
+            box-shadow: 0 0 10px var(--accent-cyan);
+        }
+
+        .status-dot.speaking {
+            background: var(--accent-green);
+            box-shadow: 0 0 10px var(--accent-green);
+            animation: pulse 0.5s ease-in-out infinite;
+        }
+
+        .status-dot.processing {
+            background: var(--accent-magenta);
+            box-shadow: 0 0 10px var(--accent-magenta);
+            animation: pulse 0.3s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.3); opacity: 0.7; }
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 1rem;
+            border: none;
+            border-radius: 8px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 212, 255, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            border-color: var(--accent-cyan);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Results Panel */
+        .results-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        /* Dual Prediction Grid */
+        .prediction-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .prediction-card {
+            padding: 1rem;
+        }
+
+        .prediction-card .card-title {
+            text-align: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .prediction-display {
+            text-align: center;
+            padding: 1rem;
+            border-radius: 8px;
+            background: var(--bg-secondary);
+        }
+
+        .prediction-value {
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+
+        .prediction-value.complete {
+            color: var(--accent-green);
+        }
+
+        .prediction-value.incomplete {
+            color: var(--accent-red);
+        }
+
+        .prediction-value.waiting {
+            color: var(--text-secondary);
+        }
+
+        /* Probability Bar */
+        .probability-container {
+            margin-top: 0.75rem;
+        }
+
+        .probability-bar-bg {
+            height: 6px;
+            background: var(--bg-primary);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .probability-bar {
+            height: 100%;
+            transition: width 0.3s ease;
+            border-radius: 3px;
+        }
+
+        .probability-bar.audio-bar {
+            background: linear-gradient(90deg, var(--accent-red), var(--accent-cyan));
+        }
+
+        .probability-bar.mm-bar {
+            background: linear-gradient(90deg, var(--accent-red), var(--accent-green));
+        }
+
+        .probability-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-align: center;
+            margin-top: 0.25rem;
+        }
+
+        .inference-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            text-align: center;
+            margin-top: 0.5rem;
+        }
+
+        /* Segment Info */
+        .segment-info {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+        }
+
+        .segment-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+
+        .segment-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+
+        /* History - Collapsible */
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .history-toggle {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            transition: transform 0.2s;
+        }
+
+        .history-toggle.collapsed {
+            transform: rotate(-90deg);
+        }
+
+        .history-list {
+            max-height: 200px;
+            overflow-y: auto;
+            transition: max-height 0.3s ease, opacity 0.2s ease;
+        }
+
+        .history-list.collapsed {
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+        }
+
+        .history-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border-color);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+
+        .history-item:last-child {
+            border-bottom: none;
+        }
+
+        .history-result {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .history-prob {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        /* Messages */
+        #status-message {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 0.5rem;
+        }
+
+        .error {
+            color: var(--accent-red) !important;
+        }
+
+        /* Waveform */
+        .waveform-container {
+            margin-top: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 0.75rem;
+        }
+
+        .waveform-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .waveform-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+
+        .waveform-level {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--accent-cyan);
+        }
+
+        #waveform-canvas {
+            width: 100%;
+            height: 60px;
+            border-radius: 4px;
+            background: var(--bg-primary);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Smart Turn</h1>
+            <p class="subtitle">Multimodal Turn-Taking Prediction · Audio + Video</p>
+        </header>
+
+        <div class="main-grid">
+            <!-- Video Section -->
+            <div class="card">
+                <div class="card-title">Live Feed</div>
+                <div class="video-container">
+                    <video id="webcam" autoplay playsinline muted></video>
+                    <div class="video-overlay">
+                        <div class="status-indicator">
+                            <div class="status-dot" id="status-dot"></div>
+                            <span id="status-text">Initializing...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="waveform-container">
+                    <div class="waveform-header">
+                        <span class="waveform-label">Microphone</span>
+                        <span class="waveform-level" id="audio-level">— dB</span>
+                    </div>
+                    <canvas id="waveform-canvas"></canvas>
+                </div>
+                <div class="controls">
+                    <button class="btn btn-primary" id="start-btn" disabled>Start Listening</button>
+                    <button class="btn btn-secondary" id="stop-btn" disabled>Stop</button>
+                </div>
+                <div id="status-message">Connecting to server...</div>
+            </div>
+
+            <!-- Results Panel -->
+            <div class="results-panel">
+                <!-- Dual Prediction Cards -->
+                <div class="prediction-grid">
+                    <!-- Audio-Only Model -->
+                    <div class="card prediction-card">
+                        <div class="card-title">🎤 Audio Only</div>
+                        <div class="prediction-display">
+                            <div class="prediction-value waiting" id="audio-prediction-text">—</div>
+                        </div>
+                        <div class="probability-container">
+                            <div class="probability-bar-bg">
+                                <div class="probability-bar audio-bar" id="audio-probability-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="probability-value" id="audio-probability-value">—</div>
+                        </div>
+                        <div class="inference-time" id="audio-time">—</div>
+                    </div>
+
+                    <!-- Multimodal Model -->
+                    <div class="card prediction-card">
+                        <div class="card-title">🎬 Audio + Video</div>
+                        <div class="prediction-display">
+                            <div class="prediction-value waiting" id="mm-prediction-text">—</div>
+                        </div>
+                        <div class="probability-container">
+                            <div class="probability-bar-bg">
+                                <div class="probability-bar mm-bar" id="mm-probability-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="probability-value" id="mm-probability-value">—</div>
+                        </div>
+                        <div class="inference-time" id="mm-time">—</div>
+                    </div>
+                </div>
+
+                <!-- Segment Info -->
+                <div class="card">
+                    <div class="segment-info">
+                        <span class="segment-label">Last segment:</span>
+                        <span class="segment-value" id="duration-value">—</span>
+                    </div>
+                </div>
+
+                <!-- History (Collapsible) -->
+                <div class="card">
+                    <div class="history-header" id="history-header">
+                        <div class="card-title" style="margin-bottom: 0;">History</div>
+                        <span class="history-toggle" id="history-toggle">▼</span>
+                    </div>
+                    <div class="history-list" id="history-list">
+                        <div class="history-item" style="color: var(--text-secondary);">
+                            No predictions yet
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const AUDIO_SAMPLE_RATE = 16000;
+        const AUDIO_CHUNK_SIZE = 4096;  // Samples per chunk to send
+        const VIDEO_BUFFER_SECONDS = 10;
+
+        // State
+        let socket = null;
+        let audioContext = null;
+        let audioStream = null;
+        let videoStream = null;
+        let audioWorklet = null;
+        let mediaRecorder = null;
+        let videoChunks = [];
+        let isListening = false;
+        let analyser = null;
+        let animationId = null;
+
+        // DOM elements
+        const webcamEl = document.getElementById('webcam');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const statusMessage = document.getElementById('status-message');
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        // Audio-only prediction elements
+        const audioPredictionText = document.getElementById('audio-prediction-text');
+        const audioProbabilityBar = document.getElementById('audio-probability-bar');
+        const audioProbabilityValue = document.getElementById('audio-probability-value');
+        const audioTimeEl = document.getElementById('audio-time');
+        // Multimodal prediction elements
+        const mmPredictionText = document.getElementById('mm-prediction-text');
+        const mmProbabilityBar = document.getElementById('mm-probability-bar');
+        const mmProbabilityValue = document.getElementById('mm-probability-value');
+        const mmTimeEl = document.getElementById('mm-time');
+        // Other elements
+        const durationValue = document.getElementById('duration-value');
+        const historyList = document.getElementById('history-list');
+        const waveformCanvas = document.getElementById('waveform-canvas');
+        const audioLevelEl = document.getElementById('audio-level');
+        const waveformCtx = waveformCanvas.getContext('2d');
+
+        // Initialize socket connection
+        function initSocket() {
+            socket = io();
+
+            socket.on('connect', () => {
+                statusMessage.textContent = 'Connected. Click Start to begin.';
+                startBtn.disabled = false;
+            });
+
+            socket.on('disconnect', () => {
+                statusMessage.textContent = 'Disconnected. Reconnecting...';
+                statusMessage.classList.add('error');
+                setStatus('disconnected');
+            });
+
+            socket.on('status', (data) => {
+                statusMessage.textContent = data.message;
+                statusMessage.classList.remove('error');
+            });
+
+            socket.on('error', (data) => {
+                statusMessage.textContent = data.message;
+                statusMessage.classList.add('error');
+            });
+
+            socket.on('vad_status', (data) => {
+                if (data.speaking) {
+                    setStatus('speaking');
+                } else {
+                    setStatus('processing');
+                }
+            });
+
+            socket.on('request_video', (data) => {
+                // Server detected end of speech, send video buffer
+                sendVideoBuffer();
+            });
+
+            socket.on('prediction', (data) => {
+                displayPrediction(data);
+                setStatus('listening');
+            });
+        }
+
+        function setStatus(status) {
+            statusDot.className = 'status-dot';
+            switch (status) {
+                case 'listening':
+                    statusDot.classList.add('listening');
+                    statusText.textContent = 'Listening...';
+                    break;
+                case 'speaking':
+                    statusDot.classList.add('speaking');
+                    statusText.textContent = 'Speech detected';
+                    break;
+                case 'processing':
+                    statusDot.classList.add('processing');
+                    statusText.textContent = 'Processing...';
+                    break;
+                default:
+                    statusText.textContent = 'Offline';
+            }
+        }
+
+        async function initMedia() {
+            try {
+                // Get video stream
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, facingMode: 'user' },
+                    audio: false
+                });
+                webcamEl.srcObject = videoStream;
+
+                // Get audio stream
+                audioStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: AUDIO_SAMPLE_RATE,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                statusMessage.textContent = 'Media ready. Click Start to begin.';
+                return true;
+            } catch (err) {
+                statusMessage.textContent = 'Error accessing camera/microphone: ' + err.message;
+                statusMessage.classList.add('error');
+                return false;
+            }
+        }
+
+        function drawWaveform() {
+            if (!analyser || !isListening) {
+                // Draw flat line when not listening
+                waveformCtx.fillStyle = '#0a0a0f';
+                waveformCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+                waveformCtx.strokeStyle = '#2a2a3a';
+                waveformCtx.lineWidth = 1;
+                waveformCtx.beginPath();
+                waveformCtx.moveTo(0, waveformCanvas.height / 2);
+                waveformCtx.lineTo(waveformCanvas.width, waveformCanvas.height / 2);
+                waveformCtx.stroke();
+                return;
+            }
+
+            animationId = requestAnimationFrame(drawWaveform);
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+
+            // Calculate RMS for level meter
+            let sum = 0;
+            for (let i = 0; i < bufferLength; i++) {
+                const val = (dataArray[i] - 128) / 128;
+                sum += val * val;
+            }
+            const rms = Math.sqrt(sum / bufferLength);
+            const db = 20 * Math.log10(Math.max(rms, 0.0001));
+            audioLevelEl.textContent = db.toFixed(0) + ' dB';
+
+            // Clear canvas
+            waveformCtx.fillStyle = '#0a0a0f';
+            waveformCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+
+            // Draw waveform
+            const gradient = waveformCtx.createLinearGradient(0, 0, waveformCanvas.width, 0);
+            gradient.addColorStop(0, '#00d4ff');
+            gradient.addColorStop(0.5, '#00ff88');
+            gradient.addColorStop(1, '#ff0080');
+            
+            waveformCtx.lineWidth = 2;
+            waveformCtx.strokeStyle = gradient;
+            waveformCtx.beginPath();
+
+            const sliceWidth = waveformCanvas.width / bufferLength;
+            let x = 0;
+
+            for (let i = 0; i < bufferLength; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = (v * waveformCanvas.height) / 2;
+
+                if (i === 0) {
+                    waveformCtx.moveTo(x, y);
+                } else {
+                    waveformCtx.lineTo(x, y);
+                }
+
+                x += sliceWidth;
+            }
+
+            waveformCtx.lineTo(waveformCanvas.width, waveformCanvas.height / 2);
+            waveformCtx.stroke();
+
+            // Draw center line
+            waveformCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+            waveformCtx.lineWidth = 1;
+            waveformCtx.beginPath();
+            waveformCtx.moveTo(0, waveformCanvas.height / 2);
+            waveformCtx.lineTo(waveformCanvas.width, waveformCanvas.height / 2);
+            waveformCtx.stroke();
+        }
+
+        function resizeWaveformCanvas() {
+            const rect = waveformCanvas.getBoundingClientRect();
+            waveformCanvas.width = rect.width * window.devicePixelRatio;
+            waveformCanvas.height = rect.height * window.devicePixelRatio;
+            waveformCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+
+        async function startListening() {
+            if (!audioStream || !videoStream) {
+                const ok = await initMedia();
+                if (!ok) return;
+            }
+
+            // Initialize audio context and processing
+            audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+            const source = audioContext.createMediaStreamSource(audioStream);
+
+            // Create analyser for waveform visualization
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+
+            // Create script processor for audio chunks
+            const processor = audioContext.createScriptProcessor(AUDIO_CHUNK_SIZE, 1, 1);
+            processor.onaudioprocess = (e) => {
+                if (!isListening) return;
+                const inputData = e.inputBuffer.getChannelData(0);
+                // Convert Float32Array to base64 for reliable transmission
+                const bytes = new Uint8Array(inputData.buffer);
+                const base64 = btoa(String.fromCharCode.apply(null, bytes));
+                socket.emit('audio_chunk', { audio_b64: base64 });
+            };
+
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+
+            // Start video recording for buffer
+            startVideoRecording();
+
+            // Enable listening BEFORE starting waveform (so animation loop starts)
+            isListening = true;
+
+            // Start waveform visualization
+            resizeWaveformCanvas();
+            drawWaveform();
+
+            setStatus('listening');
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            statusMessage.textContent = 'Listening for speech...';
+        }
+
+        function startVideoRecording() {
+            videoChunks = [];
+            mediaRecorder = new MediaRecorder(videoStream, {
+                mimeType: 'video/webm;codecs=vp8'
+            });
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) {
+                    videoChunks.push(e.data);
+                    // Keep only recent chunks (rough buffer management)
+                    const maxChunks = Math.ceil(VIDEO_BUFFER_SECONDS / 0.5);
+                    if (videoChunks.length > maxChunks) {
+                        videoChunks.shift();
+                    }
+                }
+            };
+
+            mediaRecorder.start(500);  // Capture in 500ms chunks
+        }
+
+        function sendVideoBuffer() {
+            if (videoChunks.length === 0) {
+                socket.emit('video_response', { video_b64: null });
+                return;
+            }
+
+            const blob = new Blob(videoChunks, { type: 'video/webm' });
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                // Convert ArrayBuffer to base64
+                const base64 = btoa(
+                    new Uint8Array(reader.result)
+                        .reduce((data, byte) => data + String.fromCharCode(byte), '')
+                );
+                console.log(`Sending video: ${base64.length} chars (base64)`);
+                socket.emit('video_response', { video_b64: base64 });
+            };
+            reader.readAsArrayBuffer(blob);
+        }
+
+        function stopListening() {
+            isListening = false;
+
+            // Stop waveform animation
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            analyser = null;
+            audioLevelEl.textContent = '— dB';
+            drawWaveform();  // Draw flat line
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+
+            setStatus('');
+            statusText.textContent = 'Stopped';
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusMessage.textContent = 'Stopped. Click Start to resume.';
+        }
+
+        function displayPrediction(data) {
+            // Audio-only results
+            const audioComplete = data.audio_prediction === 1;
+            const audioProb = data.audio_probability;
+            audioPredictionText.textContent = audioComplete ? 'Complete ✓' : 'Incomplete';
+            audioPredictionText.className = 'prediction-value ' + (audioComplete ? 'complete' : 'incomplete');
+            audioProbabilityBar.style.width = (audioProb * 100) + '%';
+            audioProbabilityValue.textContent = (audioProb * 100).toFixed(1) + '%';
+            audioTimeEl.textContent = data.audio_time_ms.toFixed(0) + 'ms';
+
+            // Multimodal results
+            const mmComplete = data.mm_prediction === 1;
+            const mmProb = data.mm_probability;
+            mmPredictionText.textContent = mmComplete ? 'Complete ✓' : 'Incomplete';
+            mmPredictionText.className = 'prediction-value ' + (mmComplete ? 'complete' : 'incomplete');
+            mmProbabilityBar.style.width = (mmProb * 100) + '%';
+            mmProbabilityValue.textContent = (mmProb * 100).toFixed(1) + '%';
+            mmTimeEl.textContent = data.mm_time_ms.toFixed(0) + 'ms';
+
+            // Duration
+            durationValue.textContent = data.duration_sec.toFixed(2) + 's';
+
+            // Add to history (show both)
+            addToHistory(audioComplete, audioProb, mmComplete, mmProb, data.duration_sec);
+        }
+
+        function addToHistory(audioComplete, audioProb, mmComplete, mmProb, duration) {
+            // Clear placeholder if present
+            if (historyList.children.length === 1 && 
+                historyList.children[0].textContent.includes('No predictions')) {
+                historyList.innerHTML = '';
+            }
+
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.innerHTML = `
+                <div class="history-result">
+                    <span title="Audio">${audioComplete ? '🎤✅' : '🎤❌'}</span>
+                    <span title="Multimodal">${mmComplete ? '🎬✅' : '🎬❌'}</span>
+                </div>
+                <span class="history-prob">${(audioProb * 100).toFixed(0)}% / ${(mmProb * 100).toFixed(0)}%</span>
+            `;
+
+            historyList.insertBefore(item, historyList.firstChild);
+
+            // Keep only last 10
+            while (historyList.children.length > 10) {
+                historyList.removeChild(historyList.lastChild);
+            }
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', startListening);
+        stopBtn.addEventListener('click', stopListening);
+        window.addEventListener('resize', () => {
+            resizeWaveformCanvas();
+            if (!isListening) drawWaveform();
+        });
+
+        // History toggle
+        const historyHeader = document.getElementById('history-header');
+        const historyToggle = document.getElementById('history-toggle');
+        historyHeader.addEventListener('click', () => {
+            historyList.classList.toggle('collapsed');
+            historyToggle.classList.toggle('collapsed');
+        });
+
+        // Initialize
+        initSocket();
+        initMedia();
+        
+        // Initialize waveform canvas
+        resizeWaveformCanvas();
+        drawWaveform();
+    </script>
+</body>
+</html>

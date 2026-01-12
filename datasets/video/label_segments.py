@@ -423,6 +423,7 @@ HTML_TEMPLATE = """
             <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
             <button class="filter-btn" data-filter="unlabeled" onclick="setFilter('unlabeled')">Unlabeled</button>
             <button class="filter-btn" data-filter="labeled" onclick="setFilter('labeled')">Labeled</button>
+            <button class="nav-btn" onclick="skipAllOnPage()" style="margin-left: auto;">⏭️ Skip All on Page</button>
         </div>
 
         <div class="video-group-title" id="groupTitle">Loading...</div>
@@ -454,10 +455,12 @@ HTML_TEMPLATE = """
                 const group = videoGroups[key];
                 const labeledCount = group.filter(i => entries[i].endpoint_bool !== null).length;
                 const total = group.length;
+                const viewed = group.some(i => entries[i].manually_viewed);
                 let status = '○'; // none labeled
                 if (labeledCount === total) status = '✓'; // all labeled
                 else if (labeledCount > 0) status = '◐'; // partial
-                return `<option value="${idx}">${status} ${key} (${labeledCount}/${total})</option>`;
+                const viewedIcon = viewed ? '👁️ ' : '';
+                return `<option value="${idx}">${viewedIcon}${status} ${key} (${labeledCount}/${total})</option>`;
             }).join('');
             
             updateProgress();
@@ -465,12 +468,12 @@ HTML_TEMPLATE = """
         }
 
         function updateProgress() {
-            const labeled = entries.filter(e => e.endpoint_bool !== null).length;
+            const viewed = entries.filter(e => e.manually_viewed).length;
             const total = entries.length;
-            const pct = total > 0 ? (labeled / total * 100) : 0;
+            const pct = total > 0 ? (viewed / total * 100) : 0;
             
             document.getElementById('progressFill').style.width = pct + '%';
-            document.getElementById('progressText').textContent = `${labeled} / ${total} labeled`;
+            document.getElementById('progressText').textContent = `${viewed} / ${total} viewed`;
             
             // Update select options with counts and status indicators
             const select = document.getElementById('videoSelect');
@@ -478,10 +481,12 @@ HTML_TEMPLATE = """
                 const group = videoGroups[key];
                 const labeledCount = group.filter(i => entries[i].endpoint_bool !== null).length;
                 const total = group.length;
+                const viewed = group.some(i => entries[i].manually_viewed);
                 let status = '○'; // none labeled
                 if (labeledCount === total) status = '✓'; // all labeled
                 else if (labeledCount > 0) status = '◐'; // partial
-                select.options[idx].textContent = `${status} ${key} (${labeledCount}/${total})`;
+                const viewedIcon = viewed ? '👁️ ' : '';
+                select.options[idx].textContent = `${viewedIcon}${status} ${key} (${labeledCount}/${total})`;
             });
         }
 
@@ -493,7 +498,7 @@ HTML_TEMPLATE = """
             renderSegments();
         }
 
-        function loadVideoGroup(index) {
+        async function loadVideoGroup(index) {
             currentGroupIndex = parseInt(index);
             document.getElementById('videoSelect').value = currentGroupIndex;
             document.getElementById('prevBtn').disabled = currentGroupIndex === 0;
@@ -501,6 +506,19 @@ HTML_TEMPLATE = """
             
             const groupKey = groupKeys[currentGroupIndex];
             document.getElementById('groupTitle').textContent = groupKey;
+            
+            // Mark all entries in this group as manually viewed
+            const segmentIndices = videoGroups[groupKey];
+            await fetch('/api/mark_viewed', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ indices: segmentIndices })
+            });
+            
+            // Update local entries to reflect the change
+            segmentIndices.forEach(idx => {
+                entries[idx].manually_viewed = true;
+            });
             
             renderSegments();
         }
@@ -590,6 +608,19 @@ HTML_TEMPLATE = """
             entries[idx].endpoint_bool = value;
             await saveEntry(idx);
             updateCardState(idx);
+            updateProgress();
+        }
+
+        async function skipAllOnPage() {
+            const groupKey = groupKeys[currentGroupIndex];
+            const segmentIndices = videoGroups[groupKey];
+            
+            // Update all entries to skip (null)
+            for (const idx of segmentIndices) {
+                entries[idx].endpoint_bool = null;
+                await saveEntry(idx);
+                updateCardState(idx);
+            }
             updateProgress();
         }
 
@@ -789,6 +820,19 @@ def update_entry():
         return jsonify({"success": True})
 
     return jsonify({"success": False, "error": "Invalid index"}), 400
+
+
+@app.route("/api/mark_viewed", methods=["POST"])
+def mark_viewed():
+    data = request.json
+    indices = data.get("indices", [])
+
+    for idx in indices:
+        if 0 <= idx < len(ENTRIES):
+            ENTRIES[idx]["manually_viewed"] = True
+
+    save_metadata()
+    return jsonify({"success": True, "marked_count": len(indices)})
 
 
 @app.route("/video/<path:path>")

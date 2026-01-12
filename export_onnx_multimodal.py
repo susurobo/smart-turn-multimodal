@@ -29,29 +29,33 @@ image = (
         "safetensors",
         "numpy<2.0",
         "av",
+        "onnx",
     )
 )
 
 
-# --- 1. DEFINE ARCHITECTURE (Matched to Checkpoint Shapes) ---
+# --- 1. DEFINE ARCHITECTURE (MATCHING CHECKPOINT) ---
 class SmartTurnV3Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.encoder = WhisperModel(config).encoder
         self.d_model = config.d_model
 
-        # --- FIXED: Matched to Checkpoint (256) ---
+        # --- FIX 1: Pool Attention Hidden Size = 256 ---
+        # (Default was 128, but your checkpoint has 256)
         self.pool_attention = nn.Sequential(
-            nn.Linear(self.d_model, 256),  # Was 128
-            nn.Tanh(),
-            nn.Linear(256, 1),  # Was 128
+            nn.Linear(self.d_model, 256), nn.Tanh(), nn.Linear(256, 1)
         )
 
-        # --- FIXED: Matched to Checkpoint (256) ---
+        # --- FIX 2: Classifier matches train.py architecture ---
         self.classifier = nn.Sequential(
-            nn.Linear(self.d_model, 256),  # Was 64
-            nn.ReLU(),
-            nn.Linear(256, 1),  # Was 64
+            nn.Linear(self.d_model, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
         )
 
     def forward(self, input_features):
@@ -108,11 +112,11 @@ def run_export():
     # 1. Configure
     config = WhisperConfig.from_pretrained("openai/whisper-tiny")
 
-    # --- FIXED: Force config to match checkpoint (400 positions) ---
+    # --- FIX 3: Positional Embeddings = 400 ---
     config.max_source_positions = 400
     print(f"🔧 Configured max_source_positions: {config.max_source_positions}")
 
-    print("🏗️ Initializing model architecture...")
+    print("🏗️ Initializing model architecture (Width: 256)...")
     model = SmartTurnMultimodal(config)
 
     if not os.path.exists(CHECKPOINT_PATH):
@@ -123,25 +127,17 @@ def run_export():
     print(f"💾 Loading safetensors...")
     state_dict = load_file(CHECKPOINT_PATH)
 
-    # Load weights (now sizes should match!)
-    missing, unexpected = model.load_state_dict(
-        state_dict, strict=True
-    )  # Strict=True now possible?
-
-    print(f"   Missing keys: {len(missing)}")
-    if len(missing) > 0:
-        print(f"   Sample: {missing[:3]}")
+    # Load weights (Should be strict match now)
+    model.load_state_dict(state_dict, strict=True)
+    print("✅ Weights loaded perfectly (Strict Match)!")
 
     model.eval()
     model.cpu()
 
     # 4. Create Dummy Inputs
     print("🎨 Creating dummy inputs...")
-    audio_dummy = torch.randn(1, 80, 800)  # [B, Mels, Frames]
-    # Note: Frames must match the max_source_positions scaling if fixed?
-    # Whisper Tiny uses 2 conv layers with stride 2 -> 800 input frames / 2 = 400 positions.
-    # So 800 is the correct input size for 400 positions.
-
+    # 800 frames / 2 stride = 400 positions
+    audio_dummy = torch.randn(1, 80, 800)
     video_dummy = torch.randn(1, 3, 32, 112, 112)
 
     # 5. Export
