@@ -249,8 +249,28 @@ ffmpeg -version
 
 
 
+## Sources
+
+An8MGZfoskItY22pGh1huctHm92Tqogr7MwP_Eqh6gQcz7xetCPIJFWeE7xTNFS8fSUTXuDbSZGDboEhv9lQfboDijdY8ytmCk2kVhFNmYc_MEUXf1dVzkdq89JNIxnpFN37MYfS.zip
+An9Qr02KoEoA9So2BUl7pQe_E1cAiXC2uCrIo9x113t6nQoIxRqSP9njNZXzqqmX9NVFY5EgxYVucx5nXL-YMvPdsI7XCdPBKIIAf7qVgRJq0vsRAdhrerCUwoo.zip
+An8lfhuA_uYTMf0lVzjYAHBHCHhihbmVa03BE4uqoLz90N_lkk8nK3d9pKR0wPg4DS5WdD8qEeq0HzSmVwe_9Zw2nerPqcZjurtPTFQAiKDLjfHDLYCn5yJ4-22JmhAIxyE00k03.zip
+
+CC_mini_part_1_1
+CC_mini_part_1_2
+CC_mini_part_1_3 (test)
+CC_mini_part_1_4
+An9Qr02KoEoA9So2BUl7pQe_E1cAiXC2uCrIo9x113t6nQoIxRqSP9njNZXzqqmX9NVFY5EgxYVucx5nXL-YMvPdsI7XCdPBKIIAf7qVgRJq0vsRAdhrerCUwoo.zip
+CC_mini_part_2_1 (skipped)
+CC_mini_part_2_2 An8MGZfoskItY22pGh1huctHm92Tqogr7MwP_Eqh6gQcz7xetCPIJFWeE7xTNFS8fSUTXuDbSZGDboEhv9lQfboDijdY8ytmCk2kVhFNmYc_MEUXf1dVzkdq89JNIxnpFN37MYfS.zip
+CC_mini_part_2_3  (downloading) An86mtI8qFfMJ_SwUdb3lKHq8sf4JpEydZVoVX_cvApvMnwPvNGqNysiDUyIbtR4QU896o-IM8JUtcxLh9IWAAgpYZvpIXw9IbguGSFF0sVIn5h_ElhASOq7Jn8sZJ6CQnt--7iy.zip
+
 
 # sequence
 
+python autofill_endpoint_bool.py metadata.jsonl \
+  --transcription-file /path/to/CasualConversations_transcriptions.json \
+  --exclude-text "back to neutral"
+
 python prepare_video_dataset.py ~/susurobo/data/fb_casual_conv/mini/test  ./smart_turn_multimodal_test_dataset --silence-ms 200
 
+python prepare_video_dataset.py ~/susurobo/data/fb_casual_conv/mini/ ./smart_turn_multimodal_dataset_v3 --per-segment-face --silence-ms 200

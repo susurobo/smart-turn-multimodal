@@ -7,6 +7,7 @@ metadata generation into a single pipeline.
 
 Key features:
 - Face detection on original video (once per video) for consistent cropping
+- Optional per-segment face detection (--per-segment-face) for videos with movement
 - VAD-based segmentation using Silero VAD
 - Outputs HF-compatible dataset with metadata.jsonl
 - Supports processing multiple videos into the same dataset
@@ -40,7 +41,7 @@ from tqdm import tqdm
 
 
 # --- Configuration Defaults ---
-DEFAULT_SILENCE_MS = 500
+DEFAULT_SILENCE_MS = 200
 DEFAULT_FACE_SIZE = 224
 DEFAULT_MARGIN = 40
 METADATA_FILE = "metadata.jsonl"
@@ -168,25 +169,11 @@ def find_silence_cut_points(
     return cut_points
 
 
-def detect_face_in_video(video_path: str, detector, margin: int) -> dict | None:
+def _compute_face_box(frame, detector, margin: int) -> dict | None:
     """
-    Detect face in the middle frame of the video.
+    Compute face bounding box from a frame.
     Returns face bounding box dict or None if no face detected.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    middle_frame_idx = total_frames // 2
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        return None
-
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w = frame.shape[:2]
 
@@ -225,6 +212,52 @@ def detect_face_in_video(video_path: str, detector, margin: int) -> dict | None:
         "frame_w": w,
         "frame_h": h,
     }
+
+
+def detect_face_in_video(video_path: str, detector, margin: int) -> dict | None:
+    """
+    Detect face in the middle frame of the video.
+    Returns face bounding box dict or None if no face detected.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    middle_frame_idx = total_frames // 2
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return None
+
+    return _compute_face_box(frame, detector, margin)
+
+
+def detect_face_at_timestamp(
+    video_path: str, timestamp: float, detector, margin: int
+) -> dict | None:
+    """
+    Detect face at a specific timestamp in the video.
+    Returns face bounding box dict or None if no face detected.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_idx = int(timestamp * fps)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return None
+
+    return _compute_face_box(frame, detector, margin)
 
 
 def extract_segment_with_face_crop(
@@ -320,6 +353,7 @@ def process_video(
     face_size: int,
     margin: int,
     dataset_name: str,
+    per_segment_face: bool = False,
 ) -> list:
     """
     Process a single video file.
@@ -348,15 +382,19 @@ def process_video(
     video_out_dir.mkdir(parents=True, exist_ok=True)
     audio_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Detect face in original video
-    print("  ⏳ Detecting face...")
-    face_box = detect_face_in_video(str(video_path), face_detector, margin)
-    if face_box is None:
-        print("  ⚠️ No face detected, skipping video")
-        return []
-    print(
-        f"  ✓ Face detected: {face_box['x2'] - face_box['x1']}x{face_box['y2'] - face_box['y1']}px"
-    )
+    # Step 1: Detect face in original video (unless per-segment detection is enabled)
+    face_box = None
+    if not per_segment_face:
+        print("  ⏳ Detecting face...")
+        face_box = detect_face_in_video(str(video_path), face_detector, margin)
+        if face_box is None:
+            print("  ⚠️ No face detected, skipping video")
+            return []
+        print(
+            f"  ✓ Face detected: {face_box['x2'] - face_box['x1']}x{face_box['y2'] - face_box['y1']}px"
+        )
+    else:
+        print("  ℹ️ Per-segment face detection enabled")
 
     # Step 2: Extract audio for VAD
     print("  ⏳ Running VAD...")
@@ -419,11 +457,23 @@ def process_video(
             {"segment": idx, "duration": f"{end_time - start_time:.1f}s"}
         )
 
+        # Per-segment face detection if enabled
+        segment_face_box = face_box
+        if per_segment_face:
+            segment_face_box = detect_face_at_timestamp(
+                str(video_path), start_time, face_detector, margin
+            )
+            if segment_face_box is None:
+                print(f"  ⚠️ No face detected for segment {idx}, skipping")
+                prev_cut = cut_point
+                failed_count += 1
+                continue
+
         success = extract_segment_with_face_crop(
             str(video_path),
             start_time,
             end_time,
-            face_box,
+            segment_face_box,
             str(out_video_path),
             str(out_audio_path),
             face_size,
@@ -569,6 +619,11 @@ Manual Labeling:
         default="CasualConversations_Video",
         help="Dataset name tag for metadata (default: CasualConversations_Video)",
     )
+    parser.add_argument(
+        "--per-segment-face",
+        action="store_true",
+        help="Detect face separately for each segment (slower but handles movement)",
+    )
 
     args = parser.parse_args()
 
@@ -632,6 +687,7 @@ Manual Labeling:
             args.face_size,
             args.margin,
             args.dataset_name,
+            args.per_segment_face,
         )
         all_entries.extend(new_entries)
         total_segments += len(new_entries)

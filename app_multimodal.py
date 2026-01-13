@@ -8,7 +8,6 @@ and multimodal inference (audio + video) for turn prediction.
 import os
 import time
 import math
-import tempfile
 import urllib.request
 from collections import deque
 from threading import Lock
@@ -17,12 +16,180 @@ import numpy as np
 import onnxruntime as ort
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
+from PIL import Image
 
 from inference_multimodal import (
-    predict_endpoint as predict_multimodal,
+    predict_endpoint_with_frames as predict_multimodal_frames,
     SAMPLING_RATE,
+    VIDEO_FRAMES,
+    VIDEO_SIZE,
+    VIDEO_MEAN,
+    VIDEO_STD,
 )
 from inference import predict_endpoint as predict_audio_only
+
+# Face detection for cropping (matching training data)
+try:
+    import torch
+    from facenet_pytorch import MTCNN
+
+    FACE_DETECTOR = MTCNN(
+        keep_all=False, select_largest=True, device=torch.device("cpu")
+    )
+    print("[FACE] MTCNN face detector loaded")
+except ImportError:
+    FACE_DETECTOR = None
+    print("[FACE] facenet_pytorch not installed - face detection disabled")
+    print("[FACE] Install with: pip install facenet-pytorch")
+
+
+FACE_MARGIN = (
+    20  # Smaller margin = tighter face crop (face fills more of frame)
+)
+
+
+def detect_and_crop_face(frame: np.ndarray, margin: int = FACE_MARGIN) -> tuple:
+    """
+    Detect face in frame and return crop coordinates.
+
+    Args:
+        frame: RGB numpy array (H, W, 3)
+        margin: Pixels of margin around detected face
+
+    Returns:
+        (x1, y1, x2, y2) crop box, or None if no face detected
+    """
+    if FACE_DETECTOR is None:
+        return None
+
+    h, w = frame.shape[:2]
+
+    # MTCNN expects RGB PIL Image or numpy array
+    boxes, _ = FACE_DETECTOR.detect(frame)
+
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    # Get largest face box
+    box = boxes[0]
+    x1, y1, x2, y2 = map(int, box)
+
+    # Add margin
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(w, x2 + margin)
+    y2 = min(h, y2 + margin)
+
+    # Make it square (centered)
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    side = max(crop_w, crop_h)
+
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+
+    final_x1 = max(0, center_x - side // 2)
+    final_y1 = max(0, center_y - side // 2)
+    final_x2 = min(w, final_x1 + side)
+    final_y2 = min(h, final_y1 + side)
+
+    return (final_x1, final_y1, final_x2, final_y2)
+
+
+def crop_and_resize_frames(frames: list, target_size: int = VIDEO_SIZE) -> list:
+    """
+    Detect face in first frame, then crop all frames to that region.
+
+    Args:
+        frames: List of RGB numpy arrays (H, W, 3)
+        target_size: Output size (default 112 for model)
+
+    Returns:
+        List of cropped and resized frames
+    """
+    if not frames:
+        return frames
+
+    # Detect face in middle frame (more likely to have stable face position)
+    mid_idx = len(frames) // 2
+    face_box = detect_and_crop_face(frames[mid_idx])
+
+    if face_box is None:
+        # Try first frame as fallback
+        face_box = detect_and_crop_face(frames[0])
+
+    if face_box is None:
+        print("[FACE] No face detected - using center crop")
+        # Fallback: center crop to square
+        h, w = frames[0].shape[:2]
+        side = min(h, w)
+        x1 = (w - side) // 2
+        y1 = (h - side) // 2
+        face_box = (x1, y1, x1 + side, y1 + side)
+    else:
+        x1, y1, x2, y2 = face_box
+        print(
+            f"[FACE] Detected face: ({x1},{y1}) to ({x2},{y2}) = {x2 - x1}x{y2 - y1}px"
+        )
+
+    x1, y1, x2, y2 = face_box
+
+    # Crop and resize all frames
+    cropped_frames = []
+    for frame in frames:
+        # Crop
+        cropped = frame[y1:y2, x1:x2]
+
+        # Resize to target size using PIL (matches training)
+        img = Image.fromarray(cropped)
+        img = img.resize((target_size, target_size), Image.BILINEAR)
+        cropped_frames.append(np.array(img))
+
+    return cropped_frames
+
+
+def frames_to_tensor(frames: list, flip_horizontal: bool = True) -> np.ndarray:
+    """
+    Convert list of RGB frames to model tensor format.
+
+    Args:
+        frames: List of numpy arrays (H, W, 3) uint8
+        flip_horizontal: If True, flip frames horizontally (webcam selfie -> normal view)
+
+    Returns:
+        numpy array (1, 3, 32, 112, 112) float32 normalized
+    """
+    # Ensure we have exactly VIDEO_FRAMES frames
+    if len(frames) < VIDEO_FRAMES:
+        # Pad with last frame
+        while len(frames) < VIDEO_FRAMES:
+            frames.append(
+                frames[-1]
+                if frames
+                else np.zeros((VIDEO_SIZE, VIDEO_SIZE, 3), dtype=np.uint8)
+            )
+    elif len(frames) > VIDEO_FRAMES:
+        # Take last VIDEO_FRAMES
+        frames = frames[-VIDEO_FRAMES:]
+
+    # Flip horizontally if needed (webcam selfie view -> normal view)
+    if flip_horizontal:
+        frames = [np.fliplr(f) for f in frames]
+
+    # Stack frames: (32, 112, 112, 3)
+    video = np.stack(frames).astype(np.float32) / 255.0
+
+    # Permute to (3, 32, 112, 112)
+    video = video.transpose(3, 0, 1, 2)
+
+    # Normalize
+    mean = VIDEO_MEAN.reshape(3, 1, 1, 1).astype(np.float32)
+    std = VIDEO_STD.reshape(3, 1, 1, 1).astype(np.float32)
+    video = (video - mean) / std
+
+    # Add batch dimension -> (1, 3, 32, 112, 112)
+    return np.expand_dims(video, axis=0).astype(np.float32)
+
 
 # --- Configuration ---
 CHUNK_SAMPLES = 512  # Silero VAD expects 512 samples at 16 kHz
@@ -263,7 +430,8 @@ def handle_audio_chunk(data):
 @socketio.on("video_response")
 def handle_video_response(data):
     """
-    Receive video blob from client after speech ended.
+    Receive raw video frames from client after speech ended.
+    Frames are pre-processed RGB arrays at 112x112.
     Run multimodal inference and return result.
     """
     import base64
@@ -279,77 +447,134 @@ def handle_video_response(data):
         emit("error", {"message": "No pending audio for inference"})
         return
 
-    video_b64 = data.get("video_b64")
     duration_sec = len(audio_array) / SAMPLING_RATE
-
     emit("status", {"message": f"Processing {duration_sec:.1f}s segment..."})
 
-    # Save video to temp file and convert to MP4 for better compatibility
-    video_path = None
-    webm_path = None
-    if video_b64:
+    # Process raw frames from client
+    pixel_values = None
+    frames_b64 = data.get("frames")
+
+    if frames_b64 and len(frames_b64) > 0:
         try:
-            import subprocess
+            width = data.get("width", 480)
+            height = data.get("height", 480)
 
-            video_bytes = base64.b64decode(video_b64)
+            # Decode frames from base64
+            frames = []
+            for b64 in frames_b64:
+                rgb_bytes = base64.b64decode(b64)
+                rgb = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(
+                    height, width, 3
+                )
+                frames.append(rgb)
 
-            # Save as webm first
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
-                f.write(video_bytes)
-                webm_path = f.name
+            print(f"[VIDEO] Received {len(frames)} frames at {width}x{height}")
 
-            # Convert to MP4 using ffmpeg for better PyAV compatibility
-            mp4_path = webm_path.replace(".webm", ".mp4")
-            result = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    webm_path,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "28",
-                    "-an",  # No audio needed
-                    mp4_path,
-                ],
-                capture_output=True,
-                timeout=10,
+            # Flip horizontally first (webcam selfie -> normal view)
+            frames = [np.fliplr(f) for f in frames]
+            print(
+                "[VIDEO] Applied horizontal flip (webcam selfie -> normal view)"
             )
 
-            if result.returncode == 0 and os.path.exists(mp4_path):
-                video_path = mp4_path
-                print(
-                    f"Converted video: {len(video_bytes)} bytes -> {video_path}"
-                )
-            else:
-                print(
-                    f"FFmpeg conversion failed: {result.stderr.decode()[:200]}"
-                )
-                video_path = None
+            # Face detection and cropping (matching training data)
+            frames = crop_and_resize_frames(frames, target_size=VIDEO_SIZE)
 
-        except FileNotFoundError:
-            print("FFmpeg not found - video processing disabled")
-            video_path = None
+            # Debug: Check frame stats after cropping
+            first_frame = frames[0]
+            last_frame = frames[-1]
+            print(
+                f"[VIDEO] After crop - First frame: min={first_frame.min()}, max={first_frame.max()}, mean={first_frame.mean():.1f}"
+            )
+
+            # Save debug frame to inspect visually
+            try:
+                debug_img = Image.fromarray(last_frame, mode="RGB")
+                debug_img.save("/tmp/debug_frame.png")
+                print(
+                    f"[VIDEO] Saved debug frame ({last_frame.shape}) to /tmp/debug_frame.png"
+                )
+            except Exception as e:
+                print(f"[VIDEO] Could not save debug frame: {e}")
+
+            # Convert frames to model format (C, T, H, W)
+            # flip already applied above, so pass False here
+            pixel_values = frames_to_tensor(frames, flip_horizontal=False)
+            print(
+                f"[VIDEO] Tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}"
+            )
+            print(
+                f"[VIDEO] Tensor stats - min: {pixel_values.min():.3f}, max: {pixel_values.max():.3f}, mean: {pixel_values.mean():.3f}"
+            )
+            # Per-channel stats (should be ~0 mean after normalization if data is correct)
+            for c, name in enumerate(["R", "G", "B"]):
+                ch = pixel_values[0, c]
+                print(
+                    f"[VIDEO] Channel {name}: mean={ch.mean():.3f}, std={ch.std():.3f}"
+                )
+
         except Exception as e:
-            print(f"Error processing video: {e}")
-            video_path = None
+            print(f"[VIDEO] Error processing frames: {e}")
+            import traceback
+
+            traceback.print_exc()
+            pixel_values = None
+    else:
+        print(
+            f"[VIDEO] No frames received! frames_b64={frames_b64 is not None}, len={len(frames_b64) if frames_b64 else 0}"
+        )
 
     # Run both inferences
     try:
         # Audio-only inference
+        print("[INFERENCE] Running audio-only inference...")
         t0_audio = time.perf_counter()
         result_audio = predict_audio_only(audio_array)
         audio_time_ms = (time.perf_counter() - t0_audio) * 1000
+        print(
+            f"[INFERENCE] Audio-only: {result_audio['probability']:.3f} ({audio_time_ms:.0f}ms)"
+        )
 
-        # Multimodal inference
+        # Multimodal inference with raw frames
+        has_video = pixel_values is not None
+        n_frames = pixel_values.shape[2] if has_video else 0
+        print(
+            f"[INFERENCE] Running multimodal inference (video={'YES' if has_video else 'NO'}, frames={n_frames})..."
+        )
+
+        # Debug: Show frame variation to check temporal dynamics
+        if has_video:
+            frame_means = [
+                pixel_values[0, :, t, :, :].mean()
+                for t in range(min(5, n_frames))
+            ]
+            # Check frame-to-frame difference (should show motion)
+            frame_diffs = []
+            for t in range(1, min(5, n_frames)):
+                diff = np.abs(
+                    pixel_values[0, :, t] - pixel_values[0, :, t - 1]
+                ).mean()
+                frame_diffs.append(diff)
+            print(
+                f"[INFERENCE] First 5 frame means: {[f'{m:.3f}' for m in frame_means]}"
+            )
+            print(
+                f"[INFERENCE] Frame-to-frame diffs: {[f'{d:.4f}' for d in frame_diffs]}"
+            )
+
         t0_mm = time.perf_counter()
-        result_mm = predict_multimodal(
-            audio_array, video_path=video_path, model_path=MULTIMODAL_MODEL_PATH
+        result_mm = predict_multimodal_frames(
+            audio_array,
+            pixel_values=pixel_values,
+            model_path=MULTIMODAL_MODEL_PATH,
         )
         mm_time_ms = (time.perf_counter() - t0_mm) * 1000
+        print(
+            f"[INFERENCE] Multimodal: {result_mm['probability']:.3f} ({mm_time_ms:.0f}ms)"
+        )
+
+        # Log comparison
+        diff = result_mm["probability"] - result_audio["probability"]
+        print(f"[INFERENCE] Difference (MM - Audio): {diff:+.3f}")
 
         emit(
             "prediction",
@@ -364,6 +589,9 @@ def handle_video_response(data):
                 "mm_time_ms": mm_time_ms,
                 # Metadata
                 "duration_sec": duration_sec,
+                # Debug info
+                "debug_has_video": has_video,
+                "debug_frame_count": len(frames_b64) if frames_b64 else 0,
             },
         )
     except Exception as e:
@@ -373,12 +601,6 @@ def handle_video_response(data):
         traceback.print_exc()
         emit("error", {"message": f"Inference error: {str(e)}"})
     finally:
-        # Cleanup temp video files
-        if webm_path and os.path.exists(webm_path):
-            os.unlink(webm_path)
-        if video_path and os.path.exists(video_path):
-            os.unlink(video_path)
-
         state.pending_audio = None
 
     emit("status", {"message": "Listening..."})

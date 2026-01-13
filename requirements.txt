@@ -15,3 +15,5 @@ onnx
 onnxruntime
 flask
 flask-socketio
+eventlet
+facenet-pytorch

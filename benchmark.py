@@ -369,7 +369,9 @@ class WhisperDataCollator:
 
 
 def process_predictions(logits: np.ndarray):
-    probs = logits.squeeze()
+    # Apply sigmoid to convert logits to probabilities (0-1 range)
+    logits_squeezed = logits.squeeze()
+    probs = 1 / (1 + np.exp(-logits_squeezed))
     # Ensure probs is always at least 1D to avoid concatenation issues
     # squeeze() can make (1,) -> () (0D), which breaks concatenation
     if probs.ndim == 0:

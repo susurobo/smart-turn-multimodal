@@ -514,8 +514,13 @@
     <script>
         // Configuration
         const AUDIO_SAMPLE_RATE = 16000;
-        const AUDIO_CHUNK_SIZE = 4096;  // Samples per chunk to send
-        const VIDEO_BUFFER_SECONDS = 10;
+        const AUDIO_CHUNK_SIZE = 4096;  // ScriptProcessor buffer size
+        const AUDIO_SEND_INTERVAL = 100; // ms between audio sends (batching)
+        const VIDEO_FRAME_COUNT = 32;   // Number of frames model expects
+        const VIDEO_FPS = 30;            // Target capture frame rate
+        const VIDEO_BUFFER_SECONDS = 4;  // Seconds of video to keep in buffer
+        const VIDEO_BUFFER_SIZE = VIDEO_FPS * VIDEO_BUFFER_SECONDS;  // ~120 frames
+        const VIDEO_CAPTURE_SIZE = 480;  // Capture at higher res for better face detection
 
         // State
         let socket = null;
@@ -523,11 +528,17 @@
         let audioStream = null;
         let videoStream = null;
         let audioWorklet = null;
-        let mediaRecorder = null;
-        let videoChunks = [];
+        let frameBuffer = [];            // Rolling buffer of last N frames
+        let frameCapture = null;         // Frame capture interval/processor
         let isListening = false;
         let analyser = null;
         let animationId = null;
+        let audioSendInterval = null;    // Timer for batched audio sends
+        let pendingAudioChunks = [];     // Buffer for batching audio
+        
+        // Offscreen canvas for frame extraction
+        let offscreenCanvas = null;
+        let offscreenCtx = null;
 
         // DOM elements
         const webcamEl = document.getElementById('webcam');
@@ -555,7 +566,8 @@
 
         // Initialize socket connection
         function initSocket() {
-            socket = io();
+            // Force WebSocket transport (avoid polling packet limits)
+            socket = io({ transports: ['websocket'] });
 
             socket.on('connect', () => {
                 statusMessage.textContent = 'Connected. Click Start to begin.';
@@ -588,6 +600,7 @@
 
             socket.on('request_video', (data) => {
                 // Server detected end of speech, send video buffer
+                console.log(`[VIDEO] Server requested video. Buffer has ${frameBuffer.length} frames`);
                 sendVideoBuffer();
             });
 
@@ -744,20 +757,39 @@
             processor.onaudioprocess = (e) => {
                 if (!isListening) return;
                 const inputData = e.inputBuffer.getChannelData(0);
-                // Convert Float32Array to base64 for reliable transmission
-                const bytes = new Uint8Array(inputData.buffer);
-                const base64 = btoa(String.fromCharCode.apply(null, bytes));
-                socket.emit('audio_chunk', { audio_b64: base64 });
+                // Store chunk for batched sending
+                pendingAudioChunks.push(new Float32Array(inputData));
             };
 
             source.connect(processor);
             processor.connect(audioContext.destination);
-
-            // Start video recording for buffer
-            startVideoRecording();
-
-            // Enable listening BEFORE starting waveform (so animation loop starts)
+            
+            // Enable listening FIRST - needed by frame capture and waveform loops
             isListening = true;
+            
+            // Start batched audio sending (reduces packet frequency)
+            pendingAudioChunks = [];
+            audioSendInterval = setInterval(() => {
+                if (pendingAudioChunks.length === 0) return;
+                
+                // Merge all pending chunks into one
+                const totalLength = pendingAudioChunks.reduce((sum, c) => sum + c.length, 0);
+                const merged = new Float32Array(totalLength);
+                let offset = 0;
+                for (const chunk of pendingAudioChunks) {
+                    merged.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                pendingAudioChunks = [];
+                
+                // Convert to base64 and send
+                const bytes = new Uint8Array(merged.buffer);
+                const base64 = btoa(String.fromCharCode.apply(null, bytes));
+                socket.emit('audio_chunk', { audio_b64: base64 });
+            }, AUDIO_SEND_INTERVAL);
+
+            // Start frame capture for video buffer (after isListening is true!)
+            startFrameCapture();
 
             // Start waveform visualization
             resizeWaveformCanvas();
@@ -769,44 +801,180 @@
             statusMessage.textContent = 'Listening for speech...';
         }
 
-        function startVideoRecording() {
-            videoChunks = [];
-            mediaRecorder = new MediaRecorder(videoStream, {
-                mimeType: 'video/webm;codecs=vp8'
-            });
-
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) {
-                    videoChunks.push(e.data);
-                    // Keep only recent chunks (rough buffer management)
-                    const maxChunks = Math.ceil(VIDEO_BUFFER_SECONDS / 0.5);
-                    if (videoChunks.length > maxChunks) {
-                        videoChunks.shift();
+        function startFrameCapture() {
+            // Initialize offscreen canvas for frame extraction (at model's expected size)
+            offscreenCanvas = document.createElement('canvas');
+            offscreenCanvas.width = VIDEO_CAPTURE_SIZE;
+            offscreenCanvas.height = VIDEO_CAPTURE_SIZE;
+            offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+            
+            frameBuffer = [];
+            console.log('[FRAME] Starting frame capture, videoStream:', videoStream ? 'OK' : 'NULL');
+            
+            // Try WebCodecs API first (Chrome 94+)
+            if ('MediaStreamTrackProcessor' in window) {
+                console.log('[FRAME] Using WebCodecs API for frame capture');
+                startWebCodecsCapture();
+            } else {
+                // Fallback to canvas-based capture
+                console.log('[FRAME] WebCodecs not available, using canvas fallback');
+                startCanvasCapture();
+            }
+        }
+        
+        function startWebCodecsCapture() {
+            const videoTrack = videoStream.getVideoTracks()[0];
+            console.log('[FRAME] Video track:', videoTrack ? videoTrack.label : 'NULL');
+            
+            const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+            const reader = processor.readable.getReader();
+            
+            let capturedCount = 0;
+            
+            async function readFrames() {
+                console.log('[FRAME] Starting frame read loop, isListening:', isListening);
+                while (isListening) {
+                    try {
+                        const { value: frame, done } = await reader.read();
+                        if (done) {
+                            console.log('[FRAME] Reader done');
+                            break;
+                        }
+                        
+                        // Capture every frame (~30fps)
+                        captureFrame(frame);
+                        capturedCount++;
+                        if (capturedCount % 30 === 0) {
+                            console.log(`[FRAME] Captured ${capturedCount} frames, buffer: ${frameBuffer.length}`);
+                        }
+                        frame.close();
+                    } catch (e) {
+                        console.log('[FRAME] Frame read error:', e.message);
+                        break;
                     }
                 }
-            };
-
-            mediaRecorder.start(500);  // Capture in 500ms chunks
+                console.log(`[FRAME] Read loop ended. Total captured: ${capturedCount}`);
+            }
+            
+            frameCapture = { reader, stop: () => reader.cancel() };
+            readFrames();
+        }
+        
+        function startCanvasCapture() {
+            console.log('[FRAME] Starting canvas fallback capture at ~30fps');
+            let capturedCount = 0;
+            
+            // Fallback: capture from video element at ~30fps
+            const captureInterval = setInterval(() => {
+                if (!isListening) {
+                    console.log(`[FRAME] Canvas capture stopped. Total: ${capturedCount}`);
+                    clearInterval(captureInterval);
+                    return;
+                }
+                captureFrameFromVideo();
+                capturedCount++;
+                if (capturedCount % 30 === 0) {
+                    console.log(`[FRAME] Canvas captured ${capturedCount} frames, buffer: ${frameBuffer.length}`);
+                }
+            }, 33);  // ~30fps (1000/30 ≈ 33ms)
+            
+            frameCapture = { stop: () => clearInterval(captureInterval) };
+        }
+        
+        function captureFrame(videoFrame) {
+            // Center-crop to square, then resize (preserves aspect ratio)
+            const srcW = videoFrame.displayWidth || videoFrame.codedWidth;
+            const srcH = videoFrame.displayHeight || videoFrame.codedHeight;
+            const side = Math.min(srcW, srcH);
+            const sx = (srcW - side) / 2;
+            const sy = (srcH - side) / 2;
+            
+            // Draw center-cropped square to canvas
+            offscreenCtx.drawImage(videoFrame, sx, sy, side, side, 0, 0, VIDEO_CAPTURE_SIZE, VIDEO_CAPTURE_SIZE);
+            const imageData = offscreenCtx.getImageData(0, 0, VIDEO_CAPTURE_SIZE, VIDEO_CAPTURE_SIZE);
+            
+            // Store RGB data (skip alpha)
+            const rgb = new Uint8Array(VIDEO_CAPTURE_SIZE * VIDEO_CAPTURE_SIZE * 3);
+            for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 3) {
+                rgb[j] = imageData.data[i];       // R
+                rgb[j + 1] = imageData.data[i + 1]; // G
+                rgb[j + 2] = imageData.data[i + 2]; // B
+            }
+            
+            frameBuffer.push(rgb);
+            
+            // Keep rolling buffer of last N seconds
+            if (frameBuffer.length > VIDEO_BUFFER_SIZE) {
+                frameBuffer.shift();
+            }
+        }
+        
+        function captureFrameFromVideo() {
+            // Center-crop to square, then resize (preserves aspect ratio)
+            const srcW = webcamEl.videoWidth;
+            const srcH = webcamEl.videoHeight;
+            const side = Math.min(srcW, srcH);
+            const sx = (srcW - side) / 2;
+            const sy = (srcH - side) / 2;
+            
+            // Draw center-cropped square to canvas
+            offscreenCtx.drawImage(webcamEl, sx, sy, side, side, 0, 0, VIDEO_CAPTURE_SIZE, VIDEO_CAPTURE_SIZE);
+            const imageData = offscreenCtx.getImageData(0, 0, VIDEO_CAPTURE_SIZE, VIDEO_CAPTURE_SIZE);
+            
+            const rgb = new Uint8Array(VIDEO_CAPTURE_SIZE * VIDEO_CAPTURE_SIZE * 3);
+            for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 3) {
+                rgb[j] = imageData.data[i];
+                rgb[j + 1] = imageData.data[i + 1];
+                rgb[j + 2] = imageData.data[i + 2];
+            }
+            
+            frameBuffer.push(rgb);
+            if (frameBuffer.length > VIDEO_BUFFER_SIZE) {
+                frameBuffer.shift();
+            }
         }
 
         function sendVideoBuffer() {
-            if (videoChunks.length === 0) {
-                socket.emit('video_response', { video_b64: null });
+            console.log(`[VIDEO] Buffer has ${frameBuffer.length} frames`);
+            
+            if (frameBuffer.length === 0) {
+                console.log('[VIDEO] No frames to send!');
+                socket.emit('video_response', { frames: null });
                 return;
             }
 
-            const blob = new Blob(videoChunks, { type: 'video/webm' });
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                // Convert ArrayBuffer to base64
-                const base64 = btoa(
-                    new Uint8Array(reader.result)
-                        .reduce((data, byte) => data + String.fromCharCode(byte), '')
-                );
-                console.log(`Sending video: ${base64.length} chars (base64)`);
-                socket.emit('video_response', { video_b64: base64 });
-            };
-            reader.readAsArrayBuffer(blob);
+            // Get last VIDEO_FRAME_COUNT frames
+            const framesToSend = frameBuffer.slice(-VIDEO_FRAME_COUNT);
+            
+            // Convert to base64 for transmission (chunked to avoid stack overflow)
+            const framesB64 = framesToSend.map(rgb => {
+                // Process in chunks to avoid "Maximum call stack size exceeded"
+                const chunkSize = 8192;
+                let binary = '';
+                for (let i = 0; i < rgb.length; i += chunkSize) {
+                    const chunk = rgb.subarray(i, Math.min(i + chunkSize, rgb.length));
+                    binary += String.fromCharCode.apply(null, chunk);
+                }
+                return btoa(binary);
+            });
+            
+            // Debug: check first frame data
+            const firstFrame = framesToSend[0];
+            let min = 255, max = 0, sum = 0;
+            for (let i = 0; i < firstFrame.length; i++) {
+                min = Math.min(min, firstFrame[i]);
+                max = Math.max(max, firstFrame[i]);
+                sum += firstFrame[i];
+            }
+            console.log(`[VIDEO] Sending ${framesToSend.length} frames (${VIDEO_CAPTURE_SIZE}x${VIDEO_CAPTURE_SIZE} RGB)`);
+            console.log(`[VIDEO] First frame stats - min: ${min}, max: ${max}, mean: ${(sum / firstFrame.length).toFixed(1)}`);
+            
+            socket.emit('video_response', { 
+                frames: framesB64,
+                width: VIDEO_CAPTURE_SIZE,
+                height: VIDEO_CAPTURE_SIZE,
+                count: framesToSend.length
+            });
         }
 
         function stopListening() {
@@ -820,14 +988,23 @@
             analyser = null;
             audioLevelEl.textContent = '— dB';
             drawWaveform();  // Draw flat line
+            
+            // Stop batched audio sending
+            if (audioSendInterval) {
+                clearInterval(audioSendInterval);
+                audioSendInterval = null;
+            }
+            pendingAudioChunks = [];
 
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;
             }
 
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                mediaRecorder.stop();
+            // Stop frame capture
+            if (frameCapture) {
+                frameCapture.stop();
+                frameCapture = null;
             }
 
             setStatus('');
@@ -838,6 +1015,15 @@
         }
 
         function displayPrediction(data) {
+            // Debug logging
+            console.log('[PREDICTION]', {
+                audio: data.audio_probability.toFixed(3),
+                mm: data.mm_probability.toFixed(3),
+                diff: (data.mm_probability - data.audio_probability).toFixed(3),
+                hasVideo: data.debug_has_video,
+                frameCount: data.debug_frame_count
+            });
+            
             // Audio-only results
             const audioComplete = data.audio_prediction === 1;
             const audioProb = data.audio_probability;
@@ -850,7 +1036,9 @@
             // Multimodal results
             const mmComplete = data.mm_prediction === 1;
             const mmProb = data.mm_probability;
-            mmPredictionText.textContent = mmComplete ? 'Complete ✓' : 'Incomplete';
+            const hasVideo = data.debug_has_video;
+            const videoIndicator = hasVideo ? ` (${data.debug_frame_count}f)` : ' (no video)';
+            mmPredictionText.textContent = (mmComplete ? 'Complete ✓' : 'Incomplete') + videoIndicator;
             mmPredictionText.className = 'prediction-value ' + (mmComplete ? 'complete' : 'incomplete');
             mmProbabilityBar.style.width = (mmProb * 100) + '%';
             mmProbabilityValue.textContent = (mmProb * 100).toFixed(1) + '%';
@@ -860,24 +1048,29 @@
             durationValue.textContent = data.duration_sec.toFixed(2) + 's';
 
             // Add to history (show both)
-            addToHistory(audioComplete, audioProb, mmComplete, mmProb, data.duration_sec);
+            addToHistory(audioComplete, audioProb, mmComplete, mmProb, data.duration_sec, hasVideo, data.debug_frame_count);
         }
 
-        function addToHistory(audioComplete, audioProb, mmComplete, mmProb, duration) {
+        function addToHistory(audioComplete, audioProb, mmComplete, mmProb, duration, hasVideo, frameCount) {
             // Clear placeholder if present
             if (historyList.children.length === 1 && 
                 historyList.children[0].textContent.includes('No predictions')) {
                 historyList.innerHTML = '';
             }
 
+            const videoStatus = hasVideo ? `📹${frameCount}` : '📹❌';
+            const diff = ((mmProb - audioProb) * 100).toFixed(0);
+            const diffStr = diff >= 0 ? `+${diff}` : diff;
+            
             const item = document.createElement('div');
             item.className = 'history-item';
             item.innerHTML = `
                 <div class="history-result">
                     <span title="Audio">${audioComplete ? '🎤✅' : '🎤❌'}</span>
                     <span title="Multimodal">${mmComplete ? '🎬✅' : '🎬❌'}</span>
+                    <span title="Video frames" style="font-size: 0.8em">${videoStatus}</span>
                 </div>
-                <span class="history-prob">${(audioProb * 100).toFixed(0)}% / ${(mmProb * 100).toFixed(0)}%</span>
+                <span class="history-prob">${(audioProb * 100).toFixed(0)}% / ${(mmProb * 100).toFixed(0)}% (${diffStr})</span>
             `;
 
             historyList.insertBefore(item, historyList.firstChild);

@@ -176,6 +176,66 @@ def predict_endpoint(audio_array, video_path=None, model_path=None):
     }
 
 
+def predict_endpoint_with_frames(
+    audio_array, pixel_values=None, model_path=None
+):
+    """
+    Predict whether a turn is complete using multimodal (audio + video) input.
+    This version accepts pre-processed pixel_values directly (no video file).
+
+    Args:
+        audio_array: Numpy array containing audio samples at 16kHz
+        pixel_values: Pre-processed video tensor (1, 3, 32, 112, 112) or None
+        model_path: Optional path to ONNX model. If None, uses default model.
+
+    Returns:
+        Dictionary containing prediction results:
+        - prediction: 1 for complete, 0 for incomplete
+        - probability: Probability of completion (sigmoid output)
+    """
+    # Get lazy-loaded components
+    feature_extractor = get_feature_extractor()
+    session = get_session(model_path)
+
+    # --- AUDIO PROCESSING ---
+    audio_array = truncate_audio_to_last_n_seconds(
+        audio_array, n_seconds=AUDIO_SECONDS
+    )
+
+    inputs = feature_extractor(
+        audio_array,
+        sampling_rate=SAMPLING_RATE,
+        return_tensors="np",
+        padding="max_length",
+        max_length=AUDIO_SECONDS * SAMPLING_RATE,
+        truncation=True,
+        do_normalize=True,
+    )
+
+    input_features = inputs.input_features.squeeze(0).astype(np.float32)
+    input_features = np.expand_dims(input_features, axis=0)  # (1, 80, 800)
+
+    # --- VIDEO PROCESSING ---
+    if pixel_values is None:
+        # No video provided - use zero tensor
+        pixel_values = np.zeros(
+            (1, 3, VIDEO_FRAMES, VIDEO_SIZE, VIDEO_SIZE), dtype=np.float32
+        )
+
+    # --- INFERENCE ---
+    outputs = session.run(
+        None, {"input_features": input_features, "pixel_values": pixel_values}
+    )
+
+    probability = outputs[0][0].item()
+    prediction = 1 if probability > 0.5 else 0
+
+    return {
+        "prediction": prediction,
+        "probability": probability,
+    }
+
+
 def load_audio(audio_path):
     """Load audio file and return numpy array at 16kHz."""
     import librosa
