@@ -68,3 +68,10 @@ audio run on A3
 -0.9365807771682739, 'prob_std': 3.565020799636841, 'csv_path':
 '/data/benchmark/model/CasualConv_A3_Test_20260112_131334.csv', 'plot_path':
 '/data/benchmark/model/CasualConv_A3_Test_20260112_131334.png'}}
+
+
+## Training run Jan 13, 2026, 21:57
+, 28187.88 examples/s]
+2026-01-13 12:56:16 - endpointing_training      | Video Balance Check: 708 Positives vs 9339 Negatives.
+2026-01-13 12:56:16 - endpointing_training      | Balancing Video: Upsampling POSITIVES by 13x to match Negatives.
+2026-01-13 12:56:19 - endpointing_training      | New Internal Video Size: 18543

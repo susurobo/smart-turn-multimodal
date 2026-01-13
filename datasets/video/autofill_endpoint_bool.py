@@ -17,6 +17,7 @@ import argparse
 import json
 import re
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 
@@ -43,13 +44,12 @@ def extract_batch_key_and_segment_index(
 
 def video_path_to_core_key(video_path: str) -> str:
     """
-    Extract the core identifying part from a video path (folder/video ID).
+    Convert a video path to a core key that preserves the prefix.
 
-    Example: 'CasualConversationsA/1149/1149_08.MP4' -> '1149_1149_08'
+    Example: 'CasualConversationsA/1149/1149_08.MP4' -> 'CasualConversationsA_1149_1149_08'
 
-    This ignores the prefix (CasualConversationsA, CasualConversationsH, etc.)
-    to allow matching against metadata files that may have modified prefixes
-    like 'CasualConversationsA 2'.
+    The prefix (CasualConversationsA, CasualConversationsH, etc.) is preserved
+    to distinguish between different datasets with the same folder/video structure.
     """
     # Remove extension and get just the path parts
     path = video_path.replace(".MP4", "").replace(".mp4", "")
@@ -57,10 +57,11 @@ def video_path_to_core_key(video_path: str) -> str:
 
     if len(parts) >= 3:
         # e.g., ['CasualConversationsA', '1149', '1149_08']
-        # Return: '1149_1149_08'
+        # Return: 'CasualConversationsA_1149_1149_08'
+        prefix = parts[0]
         folder = parts[-2]
         video_id = parts[-1]
-        return f"{folder}_{video_id}"
+        return f"{prefix}_{folder}_{video_id}"
     elif len(parts) == 2:
         # e.g., ['1149', '1149_08']
         return f"{parts[0]}_{parts[1]}"
@@ -93,20 +94,24 @@ def count_transcription_words(transcription: str) -> int:
     return len(words)
 
 
-def load_excluded_video_keys(
+def load_transcription_data(
     transcription_file: Path,
     exclude_texts: list[str] | None,
     min_word_count: int,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], dict[str, int], dict[str, str]]:
     """
-    Load the transcription file and extract core keys for videos to exclude.
+    Load the transcription file and extract data for exclusion and logging.
 
     Returns:
         - excluded_by_text: set of core keys for videos containing any of exclude_texts
         - excluded_by_word_count: set of core keys for videos with fewer than min_word_count words
+        - durations: dict mapping core_key -> duration_ms
+        - exclusion_reasons: dict mapping core_key -> reason string
     """
     excluded_by_text = set()
     excluded_by_word_count = set()
+    durations: dict[str, int] = {}
+    exclusion_reasons: dict[str, str] = {}
 
     with open(transcription_file, "r") as f:
         transcriptions = json.load(f)
@@ -120,12 +125,18 @@ def load_excluded_video_keys(
         transcription = entry.get("transcription", "")
         video_path = entry.get("video_path", "")
         core_key = video_path_to_core_key(video_path)
+        duration_ms = int(entry.get("duration_ms", 0))
+
+        # Store duration
+        durations[core_key] = duration_ms
 
         # Check for any exclude text pattern
         transcription_lower = transcription.lower()
+        matched_pattern = None
         for pattern in exclude_patterns:
             if pattern in transcription_lower:
                 excluded_by_text.add(core_key)
+                matched_pattern = pattern
                 break  # No need to check other patterns once matched
 
         # Check word count
@@ -133,7 +144,21 @@ def load_excluded_video_keys(
         if word_count < min_word_count:
             excluded_by_word_count.add(core_key)
 
-    return excluded_by_text, excluded_by_word_count
+        # Build exclusion reason
+        reasons = []
+        if matched_pattern:
+            reasons.append(f"contains '{matched_pattern}'")
+        if word_count < min_word_count:
+            reasons.append(f"word count {word_count} < {min_word_count}")
+        if reasons:
+            exclusion_reasons[core_key] = "; ".join(reasons)
+
+    return (
+        excluded_by_text,
+        excluded_by_word_count,
+        durations,
+        exclusion_reasons,
+    )
 
 
 def batch_key_matches_excluded(batch_key: str, excluded_keys: set[str]) -> bool:
@@ -141,17 +166,31 @@ def batch_key_matches_excluded(batch_key: str, excluded_keys: set[str]) -> bool:
     Check if a batch key matches any of the excluded core keys.
 
     batch_key: e.g., 'CasualConversationsA_1149_1149_08' or 'CasualConversationsA 2_1149_1149_08'
-    excluded_keys: e.g., {'1149_1149_08', '1275_1275_07'}
+    excluded_keys: e.g., {'CasualConversationsA_1149_1149_08', 'CasualConversationsH_1275_1275_07'}
 
-    We check if the batch_key ends with any of the excluded core keys
-    (after the prefix which may vary).
+    Handles prefix variations where 'CasualConversationsA' in transcriptions
+    may become 'CasualConversationsA 2', 'CasualConversationsA 3', etc. in metadata.
     """
     for core_key in excluded_keys:
-        # The batch_key should end with the core_key pattern
-        # e.g., 'CasualConversationsA_1149_1149_08' ends with '1149_1149_08'
-        # or 'CasualConversationsA 2_1149_1149_08' ends with '1149_1149_08'
-        if batch_key.endswith(core_key):
+        # Exact match
+        if batch_key == core_key:
             return True
+
+        # Check for suffix variations: 'CasualConversationsA_...' matches 'CasualConversationsA 2_...'
+        # Find the first underscore in the core_key to split prefix from rest
+        first_underscore = core_key.find("_")
+        if first_underscore > 0:
+            prefix = core_key[:first_underscore]  # e.g., 'CasualConversationsA'
+            rest = core_key[first_underscore:]  # e.g., '_1149_1149_08'
+
+            # Check if batch_key matches pattern: {prefix} {N}{rest}
+            # e.g., 'CasualConversationsA 2_1149_1149_08' matches 'CasualConversationsA_1149_1149_08'
+            if batch_key.startswith(prefix + " ") and batch_key.endswith(rest):
+                # Verify the middle part is just a number
+                middle = batch_key[len(prefix) + 1 : -len(rest)]
+                if middle.isdigit():
+                    return True
+
     return False
 
 
@@ -194,6 +233,9 @@ def main():
 
     # Load excluded video keys if transcription file is provided
     excluded_keys: set[str] = set()
+    durations: dict[str, int] = {}
+    exclusion_reasons: dict[str, str] = {}
+
     if args.transcription_file:
         if not args.transcription_file.exists():
             print(
@@ -202,7 +244,12 @@ def main():
             return
 
         exclude_texts = args.exclude_text if args.exclude_text else None
-        excluded_by_text, excluded_by_word_count = load_excluded_video_keys(
+        (
+            excluded_by_text,
+            excluded_by_word_count,
+            durations,
+            exclusion_reasons,
+        ) = load_transcription_data(
             args.transcription_file, exclude_texts, args.min_word_count
         )
 
@@ -280,20 +327,95 @@ def main():
 
     # Final step: nullify endpoint_bool for excluded videos (based on transcription text)
     excluded_count = 0
-    excluded_batches = 0
+    excluded_batch_list: list[
+        tuple[str, str, int, int]
+    ] = []  # (batch_key, core_key, duration, segment_count)
+    included_batch_list: list[
+        tuple[str, str, int, int]
+    ] = []  # (batch_key, core_key, duration, segment_count)
+
     if excluded_keys:
         print("\nApplying exclusions based on transcription text...")
         for batch_key, batch_entries in batches.items():
-            if batch_key_matches_excluded(batch_key, excluded_keys):
-                excluded_batches += 1
+            # Find matching core key
+            matched_core_key = None
+            for core_key in excluded_keys:
+                if batch_key == core_key:
+                    matched_core_key = core_key
+                    break
+                # Check suffix variations
+                first_underscore = core_key.find("_")
+                if first_underscore > 0:
+                    prefix = core_key[:first_underscore]
+                    rest = core_key[first_underscore:]
+                    if batch_key.startswith(
+                        prefix + " "
+                    ) and batch_key.endswith(rest):
+                        middle = batch_key[len(prefix) + 1 : -len(rest)]
+                        if middle.isdigit():
+                            matched_core_key = core_key
+                            break
+
+            if matched_core_key:
+                duration = durations.get(matched_core_key, 0)
+                segment_count = len(batch_entries)
+                excluded_batch_list.append(
+                    (batch_key, matched_core_key, duration, segment_count)
+                )
                 for entry_idx, segment_index, entry in batch_entries:
                     # Set endpoint_bool to null for ALL segments to exclude from training
                     entries[entry_idx]["endpoint_bool"] = None
                     excluded_count += 1
+            else:
+                # Try to find duration for included batches
+                # Match batch_key to a core_key in durations
+                segment_count = len(batch_entries)
+                for core_key, dur in durations.items():
+                    if batch_key == core_key:
+                        included_batch_list.append(
+                            (batch_key, core_key, dur, segment_count)
+                        )
+                        break
+                    first_underscore = core_key.find("_")
+                    if first_underscore > 0:
+                        prefix = core_key[:first_underscore]
+                        rest = core_key[first_underscore:]
+                        if batch_key.startswith(
+                            prefix + " "
+                        ) and batch_key.endswith(rest):
+                            middle = batch_key[len(prefix) + 1 : -len(rest)]
+                            if middle.isdigit():
+                                included_batch_list.append(
+                                    (batch_key, core_key, dur, segment_count)
+                                )
+                                break
 
         print(
-            f"Excluded {excluded_batches} videos ({excluded_count} segments, all set to endpoint_bool=null)"
+            f"Excluded {len(excluded_batch_list)} videos ({excluded_count} segments, all set to endpoint_bool=null)"
         )
+    else:
+        # No exclusions - all batches with matching durations are included
+        for batch_key, batch_entries in batches.items():
+            segment_count = len(batch_entries)
+            for core_key, dur in durations.items():
+                if batch_key == core_key:
+                    included_batch_list.append(
+                        (batch_key, core_key, dur, segment_count)
+                    )
+                    break
+                first_underscore = core_key.find("_")
+                if first_underscore > 0:
+                    prefix = core_key[:first_underscore]
+                    rest = core_key[first_underscore:]
+                    if batch_key.startswith(
+                        prefix + " "
+                    ) and batch_key.endswith(rest):
+                        middle = batch_key[len(prefix) + 1 : -len(rest)]
+                        if middle.isdigit():
+                            included_batch_list.append(
+                                (batch_key, core_key, dur, segment_count)
+                            )
+                            break
 
     # Write back
     with open(metadata_path, "w") as f:
@@ -301,6 +423,99 @@ def main():
             f.write(json.dumps(entry) + "\n")
 
     print(f"\nSaved to {metadata_path}")
+
+    # Generate log file if transcription file was provided
+    if args.transcription_file and (excluded_batch_list or included_batch_list):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = metadata_path.parent / f"autofill_log_{timestamp}.md"
+
+        # Calculate durations and segment counts
+        excluded_duration_ms = sum(d for _, _, d, _ in excluded_batch_list)
+        included_duration_ms = sum(d for _, _, d, _ in included_batch_list)
+        excluded_segments = sum(s for _, _, _, s in excluded_batch_list)
+        included_segments = sum(s for _, _, _, s in included_batch_list)
+
+        def ms_to_human(ms: int) -> str:
+            seconds = ms / 1000
+            minutes = seconds / 60
+            hours = minutes / 60
+            if hours >= 1:
+                return f"{hours:.2f} hours"
+            elif minutes >= 1:
+                return f"{minutes:.2f} minutes"
+            else:
+                return f"{seconds:.2f} seconds"
+
+        with open(log_path, "w") as f:
+            f.write("# Autofill Endpoint Bool Log\n\n")
+            f.write(f"**Generated:** {datetime.now().isoformat()}\n\n")
+            f.write(f"**Metadata file:** `{metadata_path}`\n\n")
+            f.write(f"**Transcription file:** `{args.transcription_file}`\n\n")
+
+            # Exclusion settings
+            f.write("## Exclusion Settings\n\n")
+            if args.exclude_text:
+                f.write(f"- **Exclude text patterns:** {args.exclude_text}\n")
+            f.write(f"- **Minimum word count:** {args.min_word_count}\n\n")
+
+            # Summary
+            f.write("## Summary\n\n")
+            f.write("| Category | Batches | Segments | Duration |\n")
+            f.write("|----------|---------|----------|----------|\n")
+            f.write(
+                f"| Excluded | {len(excluded_batch_list)} | {excluded_segments:,} | {ms_to_human(excluded_duration_ms)} ({excluded_duration_ms:,} ms) |\n"
+            )
+            f.write(
+                f"| Included | {len(included_batch_list)} | {included_segments:,} | {ms_to_human(included_duration_ms)} ({included_duration_ms:,} ms) |\n"
+            )
+            total_duration = excluded_duration_ms + included_duration_ms
+            total_batches = len(excluded_batch_list) + len(included_batch_list)
+            total_segments = excluded_segments + included_segments
+            f.write(
+                f"| **Total** | {total_batches} | {total_segments:,} | {ms_to_human(total_duration)} ({total_duration:,} ms) |\n\n"
+            )
+
+            # Final endpoint_bool distribution
+            true_count = sum(
+                1 for e in entries if e.get("endpoint_bool") is True
+            )
+            false_count = sum(
+                1 for e in entries if e.get("endpoint_bool") is False
+            )
+            null_count = sum(
+                1 for e in entries if e.get("endpoint_bool") is None
+            )
+
+            f.write("## Final Label Distribution\n\n")
+            f.write("| endpoint_bool | Count | Percentage |\n")
+            f.write("|---------------|-------|------------|\n")
+            total_entries = len(entries)
+            f.write(
+                f"| `true` | {true_count:,} | {100 * true_count / total_entries:.1f}% |\n"
+            )
+            f.write(
+                f"| `false` | {false_count:,} | {100 * false_count / total_entries:.1f}% |\n"
+            )
+            f.write(
+                f"| `null` | {null_count:,} | {100 * null_count / total_entries:.1f}% |\n"
+            )
+            f.write(f"| **Total** | {total_entries:,} | 100% |\n\n")
+
+            # Excluded batches list
+            if excluded_batch_list:
+                f.write("## Excluded Batches\n\n")
+                f.write("| Batch Key | Segments | Duration (ms) | Reason |\n")
+                f.write("|-----------|----------|---------------|--------|\n")
+                for batch_key, core_key, duration, seg_count in sorted(
+                    excluded_batch_list
+                ):
+                    reason = exclusion_reasons.get(core_key, "unknown")
+                    f.write(
+                        f"| {batch_key} | {seg_count} | {duration:,} | {reason} |\n"
+                    )
+                f.write("\n")
+
+        print(f"Log saved to {log_path}")
 
 
 if __name__ == "__main__":
