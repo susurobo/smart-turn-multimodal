@@ -168,7 +168,6 @@ def get_gpu_model_name() -> str:
             return device_name
     except Exception:
         pass
-
     # Final fallback
     return "GPU"
 
@@ -184,12 +183,10 @@ def generate_output_path(
         path_parts = onnx_path.split("/")
         if len(path_parts) >= 4:  # /data/output/{model_name}/...
             model_name = path_parts[3]
-
     # Fallback to filename if path doesn't match expected format
     if model_name is None:
         onnx_filename = os.path.basename(onnx_path)
         model_name = os.path.splitext(onnx_filename)[0]
-
     # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 

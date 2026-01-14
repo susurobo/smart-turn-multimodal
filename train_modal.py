@@ -12,8 +12,6 @@ import modal
 app = modal.App("endpointing-training")
 volume = modal.Volume.from_name("endpointing", create_if_missing=False)
 
-# In train_modal.py
-
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg")
@@ -31,11 +29,9 @@ image = (
         "onnx==1.19.1",
         "onnxruntime-gpu==1.23.2",
         "onnxscript==0.5.6",
-        # --- NEW DEPENDENCIES ---
         "torchvision",
         "av",
         "matplotlib",  # Required by benchmark.py
-        # ------------------------
     )
     .add_local_python_source("logger")
     .add_local_python_source("train")
@@ -44,8 +40,6 @@ image = (
     # Add your new script here once created
     .add_local_python_source("train_multimodal")
 )
-
-# In train_modal.py
 
 
 @app.function(
