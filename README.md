@@ -159,4 +159,7 @@ More datasets will help to generalize the model to various conversational scenar
 
 - [Maxim](https://github.com/maxipesfix)
 
-Thank you to Pipecat and Daily for leading the open-source voice ecosystem. Thank you to Meta for the Casual Conversations Dataset.
+## Thanks
+
+* Pipecat and Daily for leading the open-source voice ecosystem. 
+* Meta for the Casual Conversations Dataset.
