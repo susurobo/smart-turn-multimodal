@@ -120,10 +120,12 @@ Medium-term goals:
 * **Video branch:** R3D-18 (Kinetics-400 pretrained) processing last 32 frames (~1s) → 256-dim embedding  
 * **Fusion:** Late fusion via concatenation + linear projection back to 384-dim
 
+More details on the architecture and training are in the [blog](https://susurobo.jp/blog/smart_turn_multimodal.html).
+
 
 ## Inference
 
-Sample code for inference is included in `inference.py`. See `predict.py` and `record_and_predict.py` for usage examples.
+Sample code for inference is included in `inference_multimodal.py`. See `app_multimodal.py` for usage examples.
 
 ## Training
 
