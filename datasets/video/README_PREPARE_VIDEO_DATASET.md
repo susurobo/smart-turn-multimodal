@@ -263,6 +263,7 @@ An9Qr02KoEoA9So2BUl7pQe_E1cAiXC2uCrIo9x113t6nQoIxRqSP9njNZXzqqmX9NVFY5EgxYVucx5n
 CC_mini_part_2_1 An_a8Dnn9pKO17iCqb8-bTNQxhcgg3fBXNce-7LWfrryKuIDBFK65n-lHm
 CC_mini_part_2_2 An8MGZfoskItY22pGh1huctHm92Tqogr7MwP_Eqh6gQcz7xetCPIJFWeE7xTNFS8fSUTXuDbSZGDboEhv9lQfboDijdY8ytmCk2kVhFNmYc_MEUXf1dVzkdq89JNIxnpFN37MYfS.zip
 CC_mini_part_2_3  An86mtI8qFfMJ_SwUdb3lKHq8sf4JpEydZVoVX_cvApvMnwPvNGqNysiDUyIbtR4QU896o-IM8JUtcxLh9IWAAgpYZvpIXw9IbguGSFF0sVIn5h_ElhASOq7Jn8sZJ6CQnt--7iy.zip
+CC_mini_part_2_4 (test v3) An9TRWi-PE6HVOB1zUbfadHvNWtwHb9N3zgl0t7Bb_B6o7RjEOJMW1Gr1kPKMFq8PErL7iPXWEdaDrnFT13l-mOH1KKkCUgrT1FV1jZBsYtT8jc-13ODiqDouaXPzSbkvHBdNIvs
 
 
 # sequence
@@ -294,3 +295,9 @@ Applying exclusions based on transcription text...
 Excluded 223 videos (3466 segments, all set to endpoint_bool=null)
 
 Saved to smart_turn_multimodal_dataset_v3/metadata.jsonl
+
+
+# test v3
+python prepare_video_dataset.py ~/susurobo/data/fb_casual_conv/test/ ./smart_turn_multimodal_dataset_test_v3 --per-segment-face --silence-ms 200
+
+python autofill_endpoint_bool.py smart_turn_multimodal_dataset_test_v3/metadata.jsonl   --transcription-file CasualConversations_transcriptions.json   --exclude-text "back to neutral" "rotate" "big smile"   --min-word-count 5

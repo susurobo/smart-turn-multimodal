@@ -11,6 +11,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from torchvision import transforms
 
 from safetensors.torch import load_file
 from torchvision.models.video import r3d_18, R3D_18_Weights
@@ -163,14 +164,28 @@ class SmartTurnMultimodal(SmartTurnV3Model):
 
 
 class OnDemandMultimodalDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset, feature_extractor, dataset_root):
+    def __init__(
+        self, hf_dataset, feature_extractor, dataset_root, augment_video=False
+    ):
         self.dataset = hf_dataset
         self.feature_extractor = feature_extractor
         self.dataset_root = dataset_root
+        self.augment_video = augment_video
 
         # Standard video transform stats (Kinetics-400)
         self.mean = torch.tensor([0.43216, 0.394666, 0.37645])
         self.std = torch.tensor([0.22803, 0.22145, 0.216989])
+
+        # Video augmentation (applied per-frame before normalization)
+        if augment_video:
+            self.video_augment = transforms.ColorJitter(
+                brightness=0.4, contrast=0.4, saturation=0.2
+            )
+            log.info(
+                "Video augmentation enabled: ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2)"
+            )
+        else:
+            self.video_augment = None
 
     def __len__(self):
         return len(self.dataset)
@@ -207,6 +222,9 @@ class OnDemandMultimodalDataset(torch.utils.data.Dataset):
             tensors = []
             for frame in clip:
                 img = frame.to_image().resize((112, 112))
+                # Apply augmentation if enabled (before converting to tensor)
+                if self.video_augment is not None:
+                    img = self.video_augment(img)
                 t_img = torch.from_numpy(np.array(img)).float() / 255.0
                 tensors.append(t_img)
 
@@ -297,6 +315,7 @@ def run_multimodal_training(
     dataset_path: str,
     run_name: str,
     base_model_path: str = "openai/whisper-tiny",
+    augment_video: bool = False,
 ):
     # --- SETUP CONFIG & DATASETS (Same as before) ---
     config = WhisperConfig.from_pretrained("openai/whisper-tiny")
@@ -414,10 +433,16 @@ def run_multimodal_training(
     split = full_dataset.train_test_split(test_size=0.1, seed=42, shuffle=True)
 
     train_ds = OnDemandMultimodalDataset(
-        split["train"], feature_extractor, dataset_root=dataset_path
+        split["train"],
+        feature_extractor,
+        dataset_root=dataset_path,
+        augment_video=augment_video,
     )
     eval_ds = OnDemandMultimodalDataset(
-        split["test"], feature_extractor, dataset_root=dataset_path
+        split["test"],
+        feature_extractor,
+        dataset_root=dataset_path,
+        augment_video=False,  # No augmentation for eval
     )
 
     # --- DEFINE PATHS ---

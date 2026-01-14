@@ -60,7 +60,12 @@ image = (
         "TORCH_HOME": "/data/cache/torch",  # Caches the R3D-18 Video Model
     },
 )
-def multimodal_run(dataset_folder_name: str, run_name: str, base_model: str):
+def multimodal_run(
+    dataset_folder_name: str,
+    run_name: str,
+    base_model: str,
+    augment_video: bool = False,
+):
     import train_multimodal
 
     # old_run_name = "mm_run_20260111_1904"
@@ -68,6 +73,7 @@ def multimodal_run(dataset_folder_name: str, run_name: str, base_model: str):
         dataset_path=f"/data/datasets/{dataset_folder_name}",
         run_name=run_name,
         base_model_path=base_model,  # Pass it through
+        augment_video=augment_video,
     )
 
 
@@ -125,6 +131,7 @@ def main(
     benchmark: Optional[str] = None,
     multimodal: Optional[str] = None,
     audio_checkpoint: str = "openai/whisper-tiny",
+    augment_video: bool = False,
 ):
     if training_run_name is not None:
         training_run.remote(run_name=training_run_name)
@@ -140,4 +147,5 @@ def main(
             dataset_folder_name=multimodal,
             run_name=f"mm_run_{datetime.now().strftime('%Y%m%d_%H%M')}",
             base_model=audio_checkpoint,
+            augment_video=augment_video,
         )

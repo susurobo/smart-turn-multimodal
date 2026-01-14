@@ -204,8 +204,8 @@ MAX_DURATION_SECONDS = 8
 SILERO_VAD_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
 SILERO_VAD_PATH = "silero_vad.onnx"
 
-# Multimodal model
-MULTIMODAL_MODEL_PATH = "model_fixed.onnx"
+# Multimodal model (set via command line arg, see main())
+MULTIMODAL_MODEL_PATH = None
 
 # Flask app
 app = Flask(__name__)
@@ -606,7 +606,49 @@ def handle_video_response(data):
     emit("status", {"message": "Listening..."})
 
 
-if __name__ == "__main__":
+def main():
+    import argparse
+
+    global MULTIMODAL_MODEL_PATH
+
+    parser = argparse.ArgumentParser(
+        description="Real-time Multimodal Turn-Taking Prediction Server"
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        default="smart-turn-multimodal-cpu.onnx",
+        help="Path to multimodal ONNX model (default: smart-turn-multimodal-cpu.onnx)",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=5001,
+        help="Port to run the server on (default: 5001)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0)",
+    )
+
+    args = parser.parse_args()
+
+    # Set global model path
+    MULTIMODAL_MODEL_PATH = args.model
+
+    # Verify model exists
+    if not os.path.exists(MULTIMODAL_MODEL_PATH):
+        print(f"ERROR: Model not found: {MULTIMODAL_MODEL_PATH}")
+        print("Available models:")
+        for f in os.listdir("."):
+            if f.endswith(".onnx"):
+                print(f"  - {f}")
+        exit(1)
+
     print("=" * 60)
     print("Multimodal Turn-Taking Demo")
     print("=" * 60)
@@ -616,7 +658,11 @@ if __name__ == "__main__":
     print(f"Stop after silence: {STOP_MS}ms")
     print(f"Max duration: {MAX_DURATION_SECONDS}s")
     print("=" * 60)
-    print("Starting server at http://localhost:5001")
+    print(f"Starting server at http://{args.host}:{args.port}")
     print("=" * 60)
 
-    socketio.run(app, host="0.0.0.0", port=5001, debug=False)
+    socketio.run(app, host=args.host, port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

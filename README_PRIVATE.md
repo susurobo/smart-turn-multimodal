@@ -75,3 +75,54 @@ audio run on A3
 2026-01-13 12:56:16 - endpointing_training      | Video Balance Check: 708 Positives vs 9339 Negatives.
 2026-01-13 12:56:16 - endpointing_training      | Balancing Video: Upsampling POSITIVES by 13x to match Negatives.
 2026-01-13 12:56:19 - endpointing_training      | New Internal Video Size: 18543
+
+
+modal run export_onnx_multimodal.py --run-dir /data/output/mm_run_20260113_2153
+
+model exported:
+data/output/mm_run_20260113_2153/model_fixed.onnx
+158.55 MB
+
+# added ColorJitter agumentation
+# Without augmentation (default, same as before)
+modal run --detach train_modal.py --multimodal casual_conversations_v3
+
+# With video augmentation (ColorJitter)
+modal run --detach train_modal.py --multimodal casual_conversations_v3 --augment-video
+
+
+# put the v3 training data to modal
+modal volume put endpointing ./datasets/video/smart_turn_multimodal_dataset_test_v3 /datasets/casual_conversations_test_v3
+
+
+
+## performance multimodal 
+modal run --detach benchmark_multimodal.py --onnx-path "/data/output/mm_run_20260113_2153/model_fixed.onnx"  \
+    --dataset-path "/data/datasets/casual_conversations_test_v3" --run-description "multimodal_perf_benchmark_mm_run_20260113_2153" --perf-runs 100
+
+modal run --detach benchmark.py \
+  --onnx-path "hf-audio-only" \
+  --dataset-path "/data/datasets/casual_conversations_test_v3" \
+  --run-description "sm_audio_only_benchmark_test_v3" --perf-runs 100
+
+  # analysis
+  python analyze_benchmark.py ./benchmark/mm_run_20260113_2153/multimodal_perf_benchmark_mm_run_20260113_2153_20260114_033725.csv
+
+
+
+
+  ### Compare multimodal on aduio only and audio+video
+
+  modal run benchmark_multimodal.py \
+  --onnx-path /data/output/mm_run_20260113_2153/model_fixed.onnx \
+  --dataset-path /data/datasets/casual_conversations_test_v3 \
+  --run-description "modality_comparison" \
+  --compare-modalities \
+  --skip-perf
+
+
+  modal run --detach benchmark_multimodal.py \
+  --onnx-path /data/output/mm_run_20260113_2153/model_fixed.onnx \
+  --dataset-path /data/datasets/casual_conversations_test_v3 \
+  --run-description "multimodal_audio_only_test" \
+  --audio-only

@@ -333,6 +333,9 @@ def main():
     included_batch_list: list[
         tuple[str, str, int, int]
     ] = []  # (batch_key, core_key, duration, segment_count)
+    short_included_batch_names: list[
+        str
+    ] = []  # Included batches with < 3 segments (skipped by autofill)
 
     if excluded_keys:
         print("\nApplying exclusions based on transcription text...")
@@ -370,6 +373,8 @@ def main():
                 # Try to find duration for included batches
                 # Match batch_key to a core_key in durations
                 segment_count = len(batch_entries)
+                if segment_count < 3:
+                    short_included_batch_names.append(batch_key)
                 for core_key, dur in durations.items():
                     if batch_key == core_key:
                         included_batch_list.append(
@@ -397,6 +402,8 @@ def main():
         # No exclusions - all batches with matching durations are included
         for batch_key, batch_entries in batches.items():
             segment_count = len(batch_entries)
+            if segment_count < 3:
+                short_included_batch_names.append(batch_key)
             for core_key, dur in durations.items():
                 if batch_key == core_key:
                     included_batch_list.append(
@@ -474,6 +481,15 @@ def main():
             f.write(
                 f"| **Total** | {total_batches} | {total_segments:,} | {ms_to_human(total_duration)} ({total_duration:,} ms) |\n\n"
             )
+
+            if short_included_batch_names:
+                f.write(
+                    f"**Note:** {len(short_included_batch_names)} included batch(es) have fewer than 3 segments "
+                    f"and were skipped by autofill (no `true` label assigned):\n"
+                )
+                for batch_name in sorted(short_included_batch_names):
+                    f.write(f"- `{batch_name}`\n")
+                f.write("\n")
 
             # Final endpoint_bool distribution
             true_count = sum(

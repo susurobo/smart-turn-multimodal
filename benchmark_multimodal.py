@@ -484,9 +484,10 @@ def process_video_numpy(video_path: str) -> np.ndarray:
 
 
 class MultimodalBenchmarkDataset(Dataset):
-    def __init__(self, hf_dataset, feature_extractor):
+    def __init__(self, hf_dataset, feature_extractor, audio_only: bool = False):
         self.dataset = hf_dataset
         self.feature_extractor = feature_extractor
+        self.audio_only = audio_only  # Force zero video tensors for all samples
 
     def __len__(self):
         return len(self.dataset)
@@ -558,7 +559,13 @@ class MultimodalBenchmarkDataset(Dataset):
             pad = np.zeros((80, N_FRAMES - feats.shape[-1]), dtype=np.float32)
             feats = np.concatenate([feats, pad], axis=1)
 
-        pixel_values = process_video_numpy(video_path)
+        # Force zero video tensors if audio_only mode
+        if self.audio_only:
+            pixel_values = np.zeros(
+                (3, VIDEO_FRAMES, VIDEO_SIZE, VIDEO_SIZE), dtype=np.float32
+            )
+        else:
+            pixel_values = process_video_numpy(video_path)
         has_video = video_path is not None and os.path.exists(str(video_path))
 
         label = item.get("endpoint_bool")
@@ -691,11 +698,14 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
     md_lines = []
 
     # Header
+    audio_only = results.get("audio_only", False)
+    mode_str = "Audio-Only" if audio_only else "Video+Audio"
     md_lines.append("# Multimodal Endpointing Benchmark Report")
     md_lines.append(f"\n**Model:** `{results['onnx_path']}`")
     md_lines.append(
         f"\n**Run Description:** {results.get('run_description', 'N/A')}"
     )
+    md_lines.append(f"\n**Mode:** {mode_str}")
     md_lines.append(
         f"\n**Generated:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
     )
@@ -969,6 +979,250 @@ def format_markdown_report(results: Dict, gpu_model_name: str = "GPU") -> str:
     return "\n".join(md_lines)
 
 
+def generate_comparison_report(
+    results_video: Dict, results_audio: Dict, run_description: str
+) -> str:
+    """Generate a comparison markdown report between video+audio and audio-only modes."""
+    md_lines = []
+
+    md_lines.append("# Multimodal vs Audio-Only Comparison Report")
+    md_lines.append(f"\n**Model:** `{results_video['onnx_path']}`")
+    md_lines.append(f"\n**Run Description:** {run_description}")
+    md_lines.append(
+        f"\n**Generated:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+    )
+
+    # Dataset info
+    md_lines.append("\n## Dataset Summary")
+    md_lines.append(
+        f"\n- **Total Samples:** {results_video['total_samples']:,}"
+    )
+    md_lines.append(
+        f"- **Samples with Video Available:** {results_video['samples_with_video']:,} ({results_video['video_percentage']:.1f}%)"
+    )
+
+    # Performance Comparison Table
+    md_lines.append("\n## Performance Comparison")
+
+    metrics_v = results_video["metrics"]
+    metrics_a = results_audio["metrics"]
+
+    # Calculate deltas
+    def delta_str(v_val, a_val, higher_is_better=True, is_percent=False):
+        diff = v_val - a_val
+        if abs(diff) < 0.001:
+            return "—"
+        sign = "+" if diff > 0 else ""
+        color = ""
+        if higher_is_better:
+            color = "🟢" if diff > 0 else "🔴"
+        else:
+            color = "🔴" if diff > 0 else "🟢"
+        if is_percent:
+            return f"{color} {sign}{diff:.2f}%"
+        return f"{color} {sign}{diff:.3f}"
+
+    comp_tbl = MarkdownTable(
+        headers=["Metric", "Video+Audio", "Audio-Only", "Δ (Video Impact)"],
+        align=["left", "right", "right", "right"],
+    )
+
+    comp_tbl.add_row(
+        [
+            "Accuracy",
+            f"{metrics_v['accuracy']:.2f}%",
+            f"{metrics_a['accuracy']:.2f}%",
+            delta_str(metrics_v["accuracy"], metrics_a["accuracy"], True, True),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "Precision",
+            f"{metrics_v['precision']:.3f}",
+            f"{metrics_a['precision']:.3f}",
+            delta_str(metrics_v["precision"], metrics_a["precision"], True),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "Recall",
+            f"{metrics_v['recall']:.3f}",
+            f"{metrics_a['recall']:.3f}",
+            delta_str(metrics_v["recall"], metrics_a["recall"], True),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "F1 Score",
+            f"{metrics_v['f1']:.3f}",
+            f"{metrics_a['f1']:.3f}",
+            delta_str(metrics_v["f1"], metrics_a["f1"], True),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "False Positive Rate",
+            f"{metrics_v['false_positive_rate']:.2f}%",
+            f"{metrics_a['false_positive_rate']:.2f}%",
+            delta_str(
+                metrics_v["false_positive_rate"],
+                metrics_a["false_positive_rate"],
+                False,
+                True,
+            ),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "False Negative Rate",
+            f"{metrics_v['false_negative_rate']:.2f}%",
+            f"{metrics_a['false_negative_rate']:.2f}%",
+            delta_str(
+                metrics_v["false_negative_rate"],
+                metrics_a["false_negative_rate"],
+                False,
+                True,
+            ),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "ROC AUC",
+            f"{results_video.get('roc_auc', 0):.4f}",
+            f"{results_audio.get('roc_auc', 0):.4f}",
+            delta_str(
+                results_video.get("roc_auc", 0),
+                results_audio.get("roc_auc", 0),
+                True,
+            ),
+        ]
+    )
+    comp_tbl.add_row(
+        [
+            "PR AUC",
+            f"{results_video.get('pr_auc', 0):.4f}",
+            f"{results_audio.get('pr_auc', 0):.4f}",
+            delta_str(
+                results_video.get("pr_auc", 0),
+                results_audio.get("pr_auc", 0),
+                True,
+            ),
+        ]
+    )
+
+    md_lines.append("\n" + comp_tbl.render())
+
+    # Threshold Analysis
+    md_lines.append("\n## Threshold Analysis")
+    thresh_tbl = MarkdownTable(
+        headers=["Mode", "Best Threshold", "Best F1"],
+        align=["left", "right", "right"],
+    )
+    thresh_tbl.add_row(
+        [
+            "Video+Audio",
+            f"{results_video['best_threshold']:.2f}",
+            f"{results_video['best_f1']:.4f}",
+        ]
+    )
+    thresh_tbl.add_row(
+        [
+            "Audio-Only",
+            f"{results_audio['best_threshold']:.2f}",
+            f"{results_audio['best_f1']:.4f}",
+        ]
+    )
+    md_lines.append("\n" + thresh_tbl.render())
+
+    # Probability Distribution Comparison
+    md_lines.append("\n## Probability Distribution")
+    prob_tbl = MarkdownTable(
+        headers=["Statistic", "Video+Audio", "Audio-Only"],
+        align=["left", "right", "right"],
+    )
+    prob_tbl.add_row(
+        [
+            "Min",
+            f"{results_video['prob_min']:.4f}",
+            f"{results_audio['prob_min']:.4f}",
+        ]
+    )
+    prob_tbl.add_row(
+        [
+            "Max",
+            f"{results_video['prob_max']:.4f}",
+            f"{results_audio['prob_max']:.4f}",
+        ]
+    )
+    prob_tbl.add_row(
+        [
+            "Mean",
+            f"{results_video['prob_mean']:.4f}",
+            f"{results_audio['prob_mean']:.4f}",
+        ]
+    )
+    prob_tbl.add_row(
+        [
+            "Std",
+            f"{results_video['prob_std']:.4f}",
+            f"{results_audio['prob_std']:.4f}",
+        ]
+    )
+    md_lines.append("\n" + prob_tbl.render())
+
+    # Summary
+    md_lines.append("\n## Summary")
+    acc_diff = metrics_v["accuracy"] - metrics_a["accuracy"]
+    f1_diff = metrics_v["f1"] - metrics_a["f1"]
+
+    if acc_diff > 0.5:
+        md_lines.append(
+            f"\n✅ **Video contributes positively:** +{acc_diff:.2f}% accuracy, +{f1_diff:.3f} F1"
+        )
+    elif acc_diff < -0.5:
+        md_lines.append(
+            f"\n⚠️ **Video may be hurting performance:** {acc_diff:.2f}% accuracy, {f1_diff:.3f} F1"
+        )
+    else:
+        md_lines.append(
+            f"\n➖ **Video has minimal impact:** {acc_diff:+.2f}% accuracy, {f1_diff:+.3f} F1"
+        )
+
+    # Output files
+    md_lines.append("\n## Output Files")
+    md_lines.append("\n### Video+Audio")
+    md_lines.append(f"- CSV: `{results_video.get('csv_path', 'N/A')}`")
+    md_lines.append(f"- Plot: `{results_video.get('plot_path', 'N/A')}`")
+    md_lines.append("\n### Audio-Only")
+    md_lines.append(f"- CSV: `{results_audio.get('csv_path', 'N/A')}`")
+    md_lines.append(f"- Plot: `{results_audio.get('plot_path', 'N/A')}`")
+
+    report = "\n".join(md_lines)
+
+    # Save the comparison report
+    model_name = None
+    onnx_path = results_video["onnx_path"]
+    if onnx_path.startswith("/data/output/"):
+        path_parts = onnx_path.split("/")
+        if len(path_parts) >= 4:
+            model_name = path_parts[3]
+    if model_name is None:
+        model_name = os.path.splitext(os.path.basename(onnx_path))[0]
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"/data/benchmark/{model_name}"
+    os.makedirs(output_dir, exist_ok=True)
+    comparison_path = (
+        f"{output_dir}/{run_description}_comparison_{timestamp}.md"
+    )
+
+    with open(comparison_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    log_progress(f"📊 Comparison report saved to: {comparison_path}")
+
+    return report
+
+
 def load_robust_dataset(dataset_path: str):
     metadata_path = os.path.join(dataset_path, "metadata.jsonl")
     if os.path.exists(dataset_path) and os.path.exists(metadata_path):
@@ -1044,13 +1298,16 @@ def run_benchmark_remote(
     batch_size: int,
     perf_runs: int = PERF_RUNS_DEFAULT,
     skip_perf: bool = False,
+    audio_only: bool = False,
 ):
+    mode_str = "AUDIO-ONLY" if audio_only else "VIDEO+AUDIO"
     log_progress("=" * 80)
-    log_progress("MULTIMODAL BENCHMARK")
+    log_progress(f"MULTIMODAL BENCHMARK ({mode_str})")
     log_progress("=" * 80)
     log_progress(f"Model: {onnx_path}")
     log_progress(f"Dataset: {dataset_path}")
     log_progress(f"Run Description: {run_description}")
+    log_progress(f"Mode: {mode_str}")
     log_progress(f"Limit: {limit if limit else 'None'}")
     log_progress(f"Performance Runs: {perf_runs}")
     log_progress(f"Skip Performance Tests: {skip_perf}")
@@ -1073,7 +1330,9 @@ def run_benchmark_remote(
 
     log_progress(f"Dataset loaded: {len(raw_dataset)} samples")
     fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-tiny")
-    test_ds = MultimodalBenchmarkDataset(raw_dataset, fe)
+    test_ds = MultimodalBenchmarkDataset(raw_dataset, fe, audio_only=audio_only)
+    if audio_only:
+        log_progress("⚠️ Audio-only mode: All video inputs will be zero tensors")
 
     # --- STABILITY FIX: num_workers=0 to prevent OOM kills ---
     loader = DataLoader(
@@ -1349,6 +1608,7 @@ def run_benchmark_remote(
         "onnx_path": onnx_path,
         "dataset_path": dataset_path,
         "run_description": run_description,
+        "audio_only": audio_only,
         "total_samples": len(labels_np),
         "samples_with_video": samples_with_video,
         "video_percentage": (samples_with_video / len(labels_np) * 100)
@@ -1457,6 +1717,7 @@ def benchmark_entrypoint(
     batch_size: int = 8,
     perf_runs: int = PERF_RUNS_DEFAULT,
     skip_perf: bool = False,
+    audio_only: bool = False,
 ):
     """Remote benchmark entrypoint running on Modal GPU."""
     return run_benchmark_remote(
@@ -1467,6 +1728,7 @@ def benchmark_entrypoint(
         batch_size=batch_size,
         perf_runs=perf_runs,
         skip_perf=skip_perf,
+        audio_only=audio_only,
     )
 
 
@@ -1479,6 +1741,8 @@ def main(
     batch_size: int = 8,
     perf_runs: int = PERF_RUNS_DEFAULT,
     skip_perf: bool = False,
+    audio_only: bool = False,
+    compare_modalities: bool = False,
 ):
     """
     Run multimodal endpointing benchmark.
@@ -1491,25 +1755,80 @@ def main(
         batch_size: Batch size for inference (default 8, safer for video decoding)
         perf_runs: Number of runs for performance benchmarks (default 100)
         skip_perf: Skip performance benchmarks entirely (default False)
+        audio_only: Run benchmark with zero video tensors (audio-only mode)
+        compare_modalities: Run both video+audio and audio-only, then generate comparison report
     """
     log_progress(f"Starting multimodal benchmark: {run_description}")
     log_progress(f"Model: {onnx_path}")
     log_progress(f"Dataset: {dataset_path}")
     log_progress(f"Performance runs: {perf_runs}, Skip perf: {skip_perf}")
 
-    results = benchmark_entrypoint.remote(
-        onnx_path=onnx_path,
-        dataset_path=dataset_path,
-        run_description=run_description,
-        limit=limit,
-        batch_size=batch_size,
-        perf_runs=perf_runs,
-        skip_perf=skip_perf,
-    )
+    if compare_modalities:
+        log_progress("=" * 60)
+        log_progress("COMPARISON MODE: Running both Video+Audio and Audio-Only")
+        log_progress("=" * 60)
 
-    print("\n" + "=" * 60)
-    print("BENCHMARK COMPLETE")
-    print("=" * 60)
-    if results:
-        print(f"Results saved to: {results.get('csv_path', 'N/A')}")
-    print("=" * 60)
+        # Run with video+audio
+        log_progress("\n[1/2] Running Video+Audio benchmark...")
+        results_video = benchmark_entrypoint.remote(
+            onnx_path=onnx_path,
+            dataset_path=dataset_path,
+            run_description=f"{run_description}_video_audio",
+            limit=limit,
+            batch_size=batch_size,
+            perf_runs=perf_runs,
+            skip_perf=skip_perf,
+            audio_only=False,
+        )
+
+        # Run audio-only
+        log_progress("\n[2/2] Running Audio-Only benchmark...")
+        results_audio = benchmark_entrypoint.remote(
+            onnx_path=onnx_path,
+            dataset_path=dataset_path,
+            run_description=f"{run_description}_audio_only",
+            limit=limit,
+            batch_size=batch_size,
+            perf_runs=perf_runs,
+            skip_perf=skip_perf,
+            audio_only=True,
+        )
+
+        # Generate comparison report
+        if results_video and results_audio:
+            comparison_report = generate_comparison_report(
+                results_video, results_audio, run_description
+            )
+            print(comparison_report)
+
+        print("\n" + "=" * 60)
+        print("COMPARISON BENCHMARK COMPLETE")
+        print("=" * 60)
+        if results_video:
+            print(
+                f"Video+Audio results: {results_video.get('csv_path', 'N/A')}"
+            )
+        if results_audio:
+            print(f"Audio-Only results: {results_audio.get('csv_path', 'N/A')}")
+        print("=" * 60)
+    else:
+        mode_str = "audio-only" if audio_only else "video+audio"
+        log_progress(f"Mode: {mode_str}")
+
+        results = benchmark_entrypoint.remote(
+            onnx_path=onnx_path,
+            dataset_path=dataset_path,
+            run_description=run_description,
+            limit=limit,
+            batch_size=batch_size,
+            perf_runs=perf_runs,
+            skip_perf=skip_perf,
+            audio_only=audio_only,
+        )
+
+        print("\n" + "=" * 60)
+        print("BENCHMARK COMPLETE")
+        print("=" * 60)
+        if results:
+            print(f"Results saved to: {results.get('csv_path', 'N/A')}")
+        print("=" * 60)
